@@ -2,10 +2,16 @@
 # This script is the entry point for the SLAM3R Docker service.
 # It connects to RabbitMQ, consumes RGB images, processes them using SLAM3R,
 # and publishes the output (poses, point clouds, maps) to respective exchanges.
-# Influenced by user prompts regarding RabbitMQ integration, SLAM3R model handling,
-# desired outputs for visualization, full implementation of processing logic,
-# and addition of SLAM3R_engine imports.
-# Current Prompt: Implement all todos and placeholders.
+#
+# This file was modified to change the Hugging Face model loading mechanism.
+# Instead of attempting to download models or load them from a specified checkpoint directory at runtime,
+# the script now directly loads models using their Hugging Face IDs. This assumes that the
+# models have been pre-downloaded into the Docker image's Hugging Face cache during the build process,
+# as indicated by the user's prompt referencing the Dockerfile.
+#
+# Previous prompts influencing this file included: RabbitMQ integration, SLAM3R model handling (initial version),
+# desired outputs for visualization, full implementation of processing logic, and SLAM3R_engine imports.
+# Current influencing prompt: "change the hugging face model download to use the models downloaded in image build in @Dockerfile"
 
 import asyncio
 import os
@@ -239,53 +245,18 @@ async def initialize_slam_system():
     camera_intrinsics_dict = load_camera_intrinsics(CAMERA_INTRINSICS_FILE_PATH)
 
     try:
-        # Define the HuggingFace model IDs and paths
+        # Define the HuggingFace model IDs
         i2p_model_id = "siyan824/slam3r_i2p"
         l2w_model_id = "siyan824/slam3r_l2w"
-        path_i2p_model_dir = os.path.join(CHECKPOINTS_DIR, i2p_model_id)
-        path_l2w_model_dir = os.path.join(CHECKPOINTS_DIR, l2w_model_id)
+        # Models are expected to be pre-downloaded in the Docker image build (via Hugging Face cache).
+        # The CHECKPOINTS_DIR is still logged but models are not loaded from there directly by this function.
 
-        # Ensure checkpoint directory exists
-        os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
-        
-        # Download I2P model if missing
-        if not os.path.isdir(path_i2p_model_dir):
-            logger.info(f"Image2Points model directory not found at: {path_i2p_model_dir}. Downloading from HuggingFace...")
-            try:
-                # Create model directory structure
-                os.makedirs(path_i2p_model_dir, exist_ok=True)
-                
-                # Use the HuggingFace Hub's from_pretrained functionality
-                # This will download and initialize the model
-                i2p_model = Image2PointsModel.from_pretrained(i2p_model_id)
-                logger.info(f"Successfully downloaded Image2Points model from HuggingFace Hub")
-            except Exception as e:
-                logger.error(f"Failed to download Image2Points model: {e}")
-                is_slam_system_initialized = False
-                return False
-        
-        # Download L2W model if missing
-        if not os.path.isdir(path_l2w_model_dir):
-            logger.info(f"Local2World model directory not found at: {path_l2w_model_dir}. Downloading from HuggingFace...")
-            try:
-                # Create model directory structure
-                os.makedirs(path_l2w_model_dir, exist_ok=True)
-                
-                # Use the HuggingFace Hub's from_pretrained functionality
-                # This will download and initialize the model
-                l2w_model = Local2WorldModel.from_pretrained(l2w_model_id)
-                logger.info(f"Successfully downloaded Local2World model from HuggingFace Hub")
-            except Exception as e:
-                logger.error(f"Failed to download Local2World model: {e}")
-                is_slam_system_initialized = False
-                return False
-
-        logger.info(f"Loading Image2Points model from {path_i2p_model_dir}")
-        i2p_model = Image2PointsModel.from_pretrained(path_i2p_model_dir).to(device).eval()
+        logger.info(f"Loading Image2Points model '{i2p_model_id}' from Hugging Face cache (pre-downloaded).")
+        i2p_model = Image2PointsModel.from_pretrained(i2p_model_id).to(device).eval()
         logger.info("Image2Points model loaded.")
 
-        logger.info(f"Loading Local2World model from {path_l2w_model_dir}")
-        l2w_model = Local2WorldModel.from_pretrained(path_l2w_model_dir).to(device).eval()
+        logger.info(f"Loading Local2World model '{l2w_model_id}' from Hugging Face cache (pre-downloaded).")
+        l2w_model = Local2WorldModel.from_pretrained(l2w_model_id).to(device).eval()
         logger.info("Local2World model loaded.")
         
         # Load SLAM3R specific configuration (e.g., from a YAML file provided by SLAM3R_engine)
