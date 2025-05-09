@@ -74,7 +74,7 @@ SLAM3R_RECONSTRUCTION_VIS_EXCHANGE_OUT = os.getenv("SLAM3R_RECONSTRUCTION_VIS_EX
 
 CHECKPOINTS_DIR = os.getenv("SLAM3R_CHECKPOINTS_DIR", "/checkpoints_mount")
 SLAM3R_CONFIG_FILE_PATH_IN_CONTAINER = os.getenv("SLAM3R_CONFIG_FILE", "/app/SLAM3R_engine/configs/wild.yaml") # Default path to SLAM3R config
-CAMERA_INTRINSICS_FILE_PATH = os.getenv("CAMERA_INTRINSICS_FILE", "/app/SLAM3R_engine/camera_intrinsics.yaml") # Path to camera intrinsics YAML
+CAMERA_INTRINSICS_FILE_PATH = os.getenv("CAMERA_INTRINSICS_FILE", "/app/SLAM3R_engine/configs/camera_intrinsics.yaml") # Path to camera intrinsics YAML
 
 # Image Processing Config
 TARGET_IMAGE_WIDTH = int(os.getenv("TARGET_IMAGE_WIDTH", "640")) # Width SLAM3R expects

@@ -1,0 +1,19 @@
+# SLAM3R configuration for wild scene reconstruction
+recon_pipeline:
+  keyframe_stride: -1  # -1 for auto-adaptive keyframe stride selection
+  win_r: 5  # radius for I2P local window
+  num_scene_frame: 10  # number of frames for scene reference
+  initial_winsize: 5  # number of frames for initialization
+  conf_thres_l2w: 12.0  # confidence threshold for L2W
+  conf_thres_i2p: 1.5  # confidence threshold for I2P
+  num_points_save: 1000000  # number of points to save in final reconstruction
+  max_num_register: 10  # maximum number of frames to register in one go
+  update_buffer_intv_factor: 1  # update buffer interval factor
+  buffer_size: 100  # -1 if size is not limited
+  buffer_strategy: "reservoir"  # or "fifo"
+  norm_input_l2w: false  # whether to normalize the input pointmaps for L2W
+
+keyframe_adaptation:
+  adapt_min: 1  # minimum stride for keyframe adaptation
+  adapt_max: 20  # maximum stride for keyframe adaptation
+  adapt_stride_step: 1  # stride step for keyframe adaptation
