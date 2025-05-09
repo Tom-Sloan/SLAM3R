@@ -3,15 +3,17 @@
 # It connects to RabbitMQ, consumes RGB images, processes them using SLAM3R,
 # and publishes the output (poses, point clouds, maps) to respective exchanges.
 #
-# This file was modified to change the Hugging Face model loading mechanism.
-# Instead of attempting to download models or load them from a specified checkpoint directory at runtime,
-# the script now directly loads models using their Hugging Face IDs. This assumes that the
-# models have been pre-downloaded into the Docker image's Hugging Face cache during the build process,
-# as indicated by the user's prompt referencing the Dockerfile.
-#
-# Previous prompts influencing this file included: RabbitMQ integration, SLAM3R model handling (initial version),
-# desired outputs for visualization, full implementation of processing logic, and SLAM3R_engine imports.
-# Current influencing prompt: "change the hugging face model download to use the models downloaded in image build in @Dockerfile"
+# Prompts influencing this file:
+# - Initial: RabbitMQ integration, SLAM3R model handling, desired outputs for visualization,
+#   full implementation of processing logic, SLAM3R_engine imports.
+# - "change the hugging face model download to use the models downloaded in image build in @Dockerfile":
+#   Modified Hugging Face model loading to use pre-downloaded models via IDs from the Docker image's cache.
+# - "What is the issue? If you don't know add logs" and subsequent logs analysis:
+#   1. Added logging to diagnose a TypeError in image preprocessing.
+#   2. Modified `load_camera_intrinsics` to ensure camera intrinsic parameters (fx, fy, cx, cy)
+#      are converted to floats upon loading, resolving the initial TypeError.
+#   3. Further modified `load_camera_intrinsics` to strip whitespace from intrinsic parameter strings
+#      before float conversion, to handle ValueError caused by extraneous characters in the YAML file.
 
 import asyncio
 import os
@@ -209,7 +211,21 @@ def load_camera_intrinsics(file_path):
         if not all(k in intrinsics for k in ['fx', 'fy', 'cx', 'cy']):
             logger.error(f"Camera intrinsics file {file_path} is missing one or more keys (fx, fy, cx, cy).")
             return None
-        logger.info(f"Loaded camera intrinsics from {file_path}: {intrinsics}")
+        
+        # Convert intrinsic values to float
+        try:
+            intrinsics['fx'] = float(intrinsics['fx'].strip())
+            intrinsics['fy'] = float(intrinsics['fy'].strip())
+            intrinsics['cx'] = float(intrinsics['cx'].strip())
+            intrinsics['cy'] = float(intrinsics['cy'].strip())
+        except ValueError as e:
+            logger.error(f"Error converting camera intrinsic values to float in {file_path}: {intrinsics}. Error: {e}. Check YAML format (values should be numbers or numerical strings, without unexpected characters like trailing spaces or symbols).")
+            return None
+        except TypeError as e: # Handles cases where fx, fy, etc. might not be string/numeric (e.g. list)
+            logger.error(f"Type error during conversion of camera intrinsic values in {file_path}: {intrinsics}. Error: {e}. Ensure values are simple numbers or numerical strings.")
+            return None
+
+        logger.info(f"Loaded and converted camera intrinsics from {file_path}: {intrinsics}")
         return intrinsics
     except FileNotFoundError:
         logger.warning(f"Camera intrinsics file not found at {file_path}. Proceeding without specific intrinsics.")
@@ -341,6 +357,9 @@ def preprocess_image(image_np, target_width, target_height, intrinsics=None):
         fx, fy, cx, cy = intrinsics['fx'], intrinsics['fy'], intrinsics['cx'], intrinsics['cy']
         scale_x = target_width / width
         scale_y = target_height / height
+        logger.info(f"Debugging intrinsics: fx={fx} (type={type(fx)}), fy={fy} (type={type(fy)}), cx={cx} (type={type(cx)}), cy={cy} (type={type(cy)})")
+        logger.info(f"Debugging scales: scale_x={scale_x} (type={type(scale_x)}), scale_y={scale_y} (type={type(scale_y)})")
+        logger.info(f"Debugging image dimensions: target_width={target_width}, target_height={target_height}, width={width}, height={height}")
         adjusted_intrinsics = {
             "fx": fx * scale_x, "fy": fy * scale_y,
             "cx": cx * scale_x, "cy": cy * scale_y
