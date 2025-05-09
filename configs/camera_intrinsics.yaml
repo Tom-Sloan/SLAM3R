@@ -1,5 +1,11 @@
 # These are the primary parameters used by the SLAM3R processor's load_camera_intrinsics function.                                                           │
-fx: 905.9805764723004                                                                                                                                        │
-fy: 903.8697216493965                                                                                                                                        │
-cx: 628.6583531774853                                                                                                                                        │
-cy: 348.90016625665316                                                                                                                                       │s
+fx: 905.9805764723004
+fy: 903.8697216493965
+cx: 628.6583531774853
+cy: 348.90016625665316
+
+# These are the secondary parameters used by the SLAM3R processor's load_camera_intrinsics function.
+k1: 0.20796653247283758
+k2: -1.0209783326144832
+p1: -0.0005810334199116348
+p2: -0.0033936448334717616

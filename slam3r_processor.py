@@ -28,6 +28,7 @@ import yaml
 import shutil
 import requests
 from pathlib import Path
+import time
 from torchvision import transforms # Added for potential future use with SLAM3R utils
 
 # Configure logging (Moved Up)
@@ -214,10 +215,10 @@ def load_camera_intrinsics(file_path):
         
         # Convert intrinsic values to float
         try:
-            intrinsics['fx'] = float(intrinsics['fx'].strip())
-            intrinsics['fy'] = float(intrinsics['fy'].strip())
-            intrinsics['cx'] = float(intrinsics['cx'].strip())
-            intrinsics['cy'] = float(intrinsics['cy'].strip())
+            intrinsics['fx'] = float(intrinsics['fx'])
+            intrinsics['fy'] = float(intrinsics['fy'])
+            intrinsics['cx'] = float(intrinsics['cx'])
+            intrinsics['cy'] = float(intrinsics['cy'])
         except ValueError as e:
             logger.error(f"Error converting camera intrinsic values to float in {file_path}: {intrinsics}. Error: {e}. Check YAML format (values should be numbers or numerical strings, without unexpected characters like trailing spaces or symbols).")
             return None
@@ -374,7 +375,9 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
     global i2p_model, l2w_model, slam_params, camera_intrinsics_dict, device
     global processed_frames_history, keyframe_indices, world_point_cloud_buffer
     global current_frame_index, is_slam_initialized_for_session, slam_initialization_buffer, reference_view_id_current_session, active_kf_stride
-    
+
+    start_time = time.time()
+
     if not is_slam_system_initialized or not i2p_model or not l2w_model:
         logger.warning("SLAM3R system not (fully) initialized with models. Skipping frame processing.")
         return None, None, None
@@ -450,6 +453,7 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
             slam_initialization_buffer.append(init_view_data)
 
             if len(slam_initialization_buffer) >= slam_params['initial_winsize']:
+                init_start_time = time.time()
                 logger.info(f"Collected {len(slam_initialization_buffer)} frames. Attempting SLAM session initialization.")
                 
                 # Pre-extract img_tokens for all views in buffer (as in recon.py)
@@ -494,7 +498,10 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
                             'img': view_data['img'].to(device), # Already batched [1,C,H,W]
                             'true_shape': view_data['true_shape'].unsqueeze(0).to(device) # Batch [1,2]
                         }]
+                        token_start_time = time.time()
                         _, view_token, view_pos = slam3r_get_img_tokens(single_view_list_for_tokens, i2p_model)
+                        token_end_time = time.time()
+                        logger.info(f"get_img_tokens for view {i} took {token_end_time - token_start_time:.4f} seconds")
                         
                         initial_input_views_for_slam.append({
                             'img_tokens': view_token[0], # Remove list wrapper
@@ -524,6 +531,7 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
                     # Initialize scene using these views with tokens
                     # `slam3r_initialize_scene` expects a list of views (dicts with img_tokens, etc.)
                     # It returns initial_pcds (list of tensors), initial_confs (list of tensors), init_ref_id
+                    init_scene_start_time = time.time()
                     initial_pcds_tensors, initial_confs_tensors, init_ref_id = slam3r_initialize_scene(
                         initial_input_views_for_slam[::active_kf_stride], # Pass only keyframes based on stride
                         i2p_model,
@@ -531,6 +539,8 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
                         conf_thres=slam_params['conf_thres_i2p'], # This is for point generation, not the quality check threshold
                         return_ref_id=True
                     )
+                    init_scene_end_time = time.time()
+                    logger.info(f"slam3r_initialize_scene took {init_scene_end_time - init_scene_start_time:.4f} seconds")
                     reference_view_id_current_session = init_ref_id # This is local index within the initial_input_views_for_slam[::active_kf_stride]
 
                     # --- Initialization Quality Check ---
@@ -567,9 +577,32 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
                         init_kf_counter = 0
                         for i in range(len(slam_initialization_buffer)):
                             history_idx = current_frame_index - len(slam_initialization_buffer) + i + 1
-                            
-                            processed_frames_history[history_idx]['img_tokens'] = initial_input_views_for_slam[i]['img_tokens']
-                            processed_frames_history[history_idx]['img_pos'] = initial_input_views_for_slam[i]['img_pos']
+
+                            # Check if history_idx is within range
+                            if history_idx >= len(processed_frames_history):
+                                logger.warning(f"History index {history_idx} out of range for processed_frames_history (length {len(processed_frames_history)})")
+                                # Append empty frame data to processed_frames_history if needed
+                                while len(processed_frames_history) <= history_idx:
+                                    processed_frames_history.append({
+                                        'img_tensor': None,
+                                        'img_tokens': None,
+                                        'img_pos': None,
+                                        'true_shape': None,
+                                        'timestamp_ns': None,
+                                        'keyframe_id': None,
+                                        'pts3d_cam': None,
+                                        'conf_cam': None,
+                                        'pts3d_world': None,
+                                        'conf_world': None,
+                                        'raw_pose_matrix': np.eye(4).tolist()
+                                    })
+
+                            # Make sure we have a valid index before accessing initial_input_views_for_slam
+                            if i < len(initial_input_views_for_slam):
+                                processed_frames_history[history_idx]['img_tokens'] = initial_input_views_for_slam[i]['img_tokens']
+                                processed_frames_history[history_idx]['img_pos'] = initial_input_views_for_slam[i]['img_pos']
+                            else:
+                                logger.warning(f"Index {i} out of range for initial_input_views_for_slam (length {len(initial_input_views_for_slam)})")
 
                             if i % active_kf_stride == 0 and init_kf_counter < len(initial_pcds_tensors):
                                 kf_original_buffer_index = i 
@@ -620,22 +653,56 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
             # This needs careful adaptation of i2p_inference_batch or a stream-friendly version.
             # For now, let's try with a window of 1 (current frame only) as ref.
             
-            current_i2p_input_view = { # This is the 'view' structure for i2p_inference_batch
-                'img_tokens': frame_data_for_history['img_tokens'],
-                'img_pos': frame_data_for_history['img_pos'],
-                'true_shape': frame_data_for_history['true_shape'],
-                'label': f"frame_{current_frame_index}"
-            }
-            # i2p_inference_batch takes list_of_lists_of_views.
-            # ref_id is local to the inner list.
-            i2p_output = i2p_inference_batch([[current_i2p_input_view]], i2p_model, ref_id=0, tocpu=False, unsqueeze=False)
+            # The model expects multiple views - it can't process single views
+            # Create a multi-view input with the current frame and at least one previous frame
+            # Let's get the latest keyframe as a reference view
+            multiview_input = []
+
+            if keyframe_indices:
+                # Get the most recent keyframe
+                ref_kf_idx = keyframe_indices[-1]
+                ref_kf_view = {
+                    'img_tokens': processed_frames_history[ref_kf_idx]['img_tokens'],
+                    'img_pos': processed_frames_history[ref_kf_idx]['img_pos'],
+                    'true_shape': processed_frames_history[ref_kf_idx]['true_shape'],
+                    'label': f"keyframe_{ref_kf_idx}"
+                }
+
+                current_i2p_input_view = {
+                    'img_tokens': frame_data_for_history['img_tokens'],
+                    'img_pos': frame_data_for_history['img_pos'],
+                    'true_shape': frame_data_for_history['true_shape'],
+                    'label': f"frame_{current_frame_index}"
+                }
+
+                # Create the multi-view input with the reference view first, then current view
+                multiview_input = [[ref_kf_view, current_i2p_input_view]]
+
+                logger.info(f"Using multi-view input with reference keyframe {ref_kf_idx} and current frame {current_frame_index}")
+
+                # i2p_inference_batch takes list_of_lists_of_views.
+                # ref_id is local to the inner list - we use 0 to set the keyframe as reference
+                i2p_output = i2p_inference_batch(multiview_input, i2p_model, ref_id=0, tocpu=False, unsqueeze=False)
+            else:
+                logger.error("No keyframes available for I2P multi-view processing. Cannot process current frame.")
+                return None, None, None
             
             # i2p_output['preds'] is a list (outer batch) of lists (inner window) of dicts
             # Each dict has 'pts3d', 'conf'
-            current_pts3d_cam = i2p_output['preds'][0][0]['pts3d']  # Shape: (1, H, W, 3) or (1, N, 3)
-            current_conf_cam = i2p_output['preds'][0][0]['conf']    # Shape: (1, H, W) or (1, N)
-            frame_data_for_history['pts3d_cam'] = current_pts3d_cam
-            frame_data_for_history['conf_cam'] = current_conf_cam
+            # Since we're using a reference view (0) and current view (1), we need the result for the current view
+            try:
+                # The structure is different now - we need to get the current view results, which is index 1
+                # [0] is the first batch, [1] is the current frame (second view)
+                current_pts3d_cam = i2p_output['preds'][0][1]['pts3d']  # Shape: (1, H, W, 3) or (1, N, 3)
+                current_conf_cam = i2p_output['preds'][0][1]['conf']    # Shape: (1, H, W) or (1, N)
+                frame_data_for_history['pts3d_cam'] = current_pts3d_cam
+                frame_data_for_history['conf_cam'] = current_conf_cam
+                logger.info(f"Successfully processed I2P for frame {current_frame_index} with shape {current_pts3d_cam.shape}")
+            except (IndexError, KeyError) as e:
+                logger.error(f"Error accessing I2P output: {e}. Output structure: {list(i2p_output.keys())} with preds length: {len(i2p_output.get('preds', []))}")
+                frame_data_for_history['pts3d_cam'] = None
+                frame_data_for_history['conf_cam'] = None
+                return None, None, None
 
 
             # 2. L2W: Register local points (current_pts3d_cam) to world frame
@@ -643,7 +710,12 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
             current_pose_R = np.eye(3)
             current_pose_t = np.zeros((3,1))
 
-            if keyframe_indices: # Ensure we have keyframes to register against
+            # Skip L2W if we couldn't get valid points from I2P
+            if frame_data_for_history['pts3d_cam'] is None:
+                logger.warning(f"No valid points from I2P for frame {current_frame_index}. Skipping L2W registration.")
+            elif not keyframe_indices:
+                logger.warning("No keyframes available for L2W, skipping L2W for current frame.")
+            else: # We have valid points and keyframes, proceed with L2W
                 # Prepare L2W input: current frame + selected keyframes
                 # Keyframes need 'pts3d_world', 'img_tokens', 'img_pos', 'true_shape'
                 
@@ -790,8 +862,6 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
                         frame_data_for_history['keyframe_id'] = f"kf_{len(keyframe_indices)-1}"
                         keyframe_id_for_output = frame_data_for_history['keyframe_id']
                         logger.info(f"Frame {current_frame_index} selected as Keyframe {frame_data_for_history['keyframe_id']}. Total KFs: {len(keyframe_indices)}")
-            else: # Should not happen if initialization was successful
-                logger.warning("No keyframes available for L2W, skipping L2W for current frame.")
         
         # Update history and index
         processed_frames_history.append(frame_data_for_history)
@@ -832,6 +902,10 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
         
         # Optional: Prune processed_frames_history if it gets too large and items are not needed
         # (e.g. if not a keyframe and its tokens/points are no longer needed for L2W lookback)
+
+        end_time = time.time()
+        total_time = end_time - start_time
+        logger.info(f"Total processing time for frame {current_frame_index}: {total_time:.4f} seconds")
 
         return pose_data, point_cloud_data, reconstruction_update_data
 
@@ -940,8 +1014,9 @@ async def main():
     
     async with connection:
         channel = await connection.channel()
-        # Lower prefetch_count if SLAM processing is slow to avoid message buildup
-        await channel.set_qos(prefetch_count=5) 
+        # Set prefetch_count to 1 to ensure we process one frame at a time
+        # This prevents message buildup when processing is slow (which it is during initialization)
+        await channel.set_qos(prefetch_count=1) 
 
         exchanges = {}
         # Declare input exchanges
