@@ -88,15 +88,6 @@ from torchvision import transforms # Added for potential future use with SLAM3R 
 # Rerun import
 import rerun as rr
 
-def log_image_rr(path: str, img):
-    rr.log(path, rr.Image(img))
-
-def log_transform3d_rr(path: str, *, translation=None, rotation=None, scale=None):
-    rr.log(path, rr.Transform3D(translation=translation, rotation=rotation, scale=scale))
-
-def log_points_rr(path: str, positions, *, colors=None, radii=None):
-    rr.log(path, rr.Points3D(positions=positions, colors=colors, radii=radii))
-
 # Configure logging (Moved Up)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -539,7 +530,7 @@ def demo_point_grid(size: int = 10):
     # radii must be one‑per‑point (or None)
     radii = np.full((positions.shape[0],), 0.5, dtype=np.float32)
 
-    log_points_rr("world/demo_point_grid", positions, colors=colors, radii=radii)
+    rr.log("world/demo_point_grid", rr.Points3D(positions=positions, colors=colors, radii=radii))
 
 def preprocess_image(image_np, target_width, target_height, intrinsics=None):
     """
@@ -655,7 +646,7 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
         if rerun_connected:
             # Log RGB image (convert BGR to RGB)
             rgb_image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
-            rr.log_image("world/camera/image", rgb_image_np)
+            rr.log("world/camera/image", rr.Image(rgb_image_np))
 
             # Log Camera Intrinsics if available
             if current_frame_intrinsics:
@@ -668,11 +659,12 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
                     [0, fy, cy],
                     [0, 0, 1]
                 ])
-                rr.log_pinhole(
+                rr.log(
                     "world/camera",
-                    child_from_parent=intrinsics_matrix,
-                    width=TARGET_IMAGE_WIDTH,
-                    height=TARGET_IMAGE_HEIGHT
+                    rr.Pinhole(
+                        image_from_camera=intrinsics_matrix,
+                        resolution=[TARGET_IMAGE_WIDTH, TARGET_IMAGE_HEIGHT],
+                    ),
                 )
 
         # Prepare view dict as expected by SLAM3R utils (based on recon.py and app.py)
@@ -1146,21 +1138,21 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
                         keyframe_id_for_output = frame_data_for_history['keyframe_id']
                         logger.info(f"Frame {current_frame_index} selected as Keyframe {frame_data_for_history['keyframe_id']}. Total KFs: {len(keyframe_indices)}")
                         if rerun_connected:
-                            rr.log_text_entry("log/info", text=f"Keyframe {frame_data_for_history['keyframe_id']} added at frame {current_frame_index}", color=[0, 255, 0])
+                            rr.log("log/info", rr.TextLog(text=f"Keyframe {frame_data_for_history['keyframe_id']} added at frame {current_frame_index}", color=[0, 255, 0]))
                             # Log keyframe pose distinctly if desired
                             kf_pose_matrix = np.array(frame_data_for_history['raw_pose_matrix'])
                             kf_position = kf_pose_matrix[:3, 3]
                             kf_orientation_m = kf_pose_matrix[:3,:3]
                             kf_orientation_q = matrix_to_quaternion(kf_orientation_m) # x,y,z,w
 
-                            rr.log_transform3d(
+                            rr.log(
                                 f"world/keyframes/{frame_data_for_history['keyframe_id']}",
-                                transform=rr.TranslationRotationScale3D(
+                                rr.Transform3D(
                                     translation=kf_position,
                                     rotation=rr.Quaternion(xyzw=kf_orientation_q)
                                 )
                             )
-                            rr.log_point(f"world/keyframes/{frame_data_for_history['keyframe_id']}/center", position=[0,0,0], radius=0.02, color=[255,255,0])
+                            rr.log(f"world/keyframes/{frame_data_for_history['keyframe_id']}/center", rr.Points3D(positions=[[0,0,0]], radii=[0.02], colors=[[255,255,0]])) # Use Points3D for single points
         
         # Update history and index
         processed_frames_history.append(frame_data_for_history)
@@ -1177,9 +1169,9 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
 
         if rerun_connected:
             # Log current camera pose
-            rr.log_transform3d(
+            rr.log(
                 "world/camera",
-                transform=rr.TranslationRotationScale3D(
+                rr.Transform3D(
                     translation=position_np_arr,
                     rotation=rr.Quaternion(xyzw=orientation_q_xyzw)
                 )
@@ -1198,15 +1190,14 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
                 
                 if np.any(valid_mask_local_viz):
                     P_local_filtered_viz = P_local_np_viz[valid_mask_local_viz]
-                    rr.log_points("world/camera/local_scan", P_local_filtered_viz, colors=[255, 0, 255], radii=0.005) # Magenta for local scan
+                    # rr.log_points("world/camera/local_scan", P_local_filtered_viz, colors=[255, 0, 255], radii=0.005) # Magenta for local scan
+                    rr.log("world/camera/local_scan", rr.Points3D(positions=P_local_filtered_viz, colors=[255, 0, 255], radii=0.005))
 
             # Log incremental world points (from L2W)
             if temp_points_xyz_list: # This list contains newly added world points
-                rr.log_points("world/points", np.array(temp_points_xyz_list), colors=[0, 0, 255], radii=0.007) # Blue for world points
+                # rr.log_points("world/points", np.array(temp_points_xyz_list), colors=[0, 0, 255], radii=0.007) # Blue for world points
+                rr.log("world/points", rr.Points3D(positions=np.array(temp_points_xyz_list), colors=[0, 0, 255], radii=0.007))
             
-            # The logger warning for dynamic data logging should remain if needed
-            # logger.warning(f"Rerun: Error logging dynamic data (pose/points): {e_rerun_dynamic}")
-            # Or remove the 'except' if the try block was fully removed. Assuming full removal:
 
         pose_data = {
             "timestamp_ns": timestamp_ns,

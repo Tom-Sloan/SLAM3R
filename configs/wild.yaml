@@ -5,7 +5,7 @@ recon_pipeline:
   num_scene_frame: 10  # number of frames for scene reference
   initial_winsize: 5  # number of frames for initialization
   conf_thres_l2w: 12.0  # confidence threshold for L2W
-  conf_thres_i2p: 1.5  # confidence threshold for I2P
+  conf_thres_i2p: 0.5  # confidence threshold for I2P
   num_points_save: 1000000  # number of points to save in final reconstruction
   max_num_register: 10  # maximum number of frames to register in one go
   update_buffer_intv_factor: 1  # update buffer interval factor
