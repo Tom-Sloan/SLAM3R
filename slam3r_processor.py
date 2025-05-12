@@ -1,19 +1,73 @@
 # slam3r/slam3r_processor.py
-# This script is the entry point for the SLAM3R Docker service.
-# It connects to RabbitMQ, consumes RGB images, processes them using SLAM3R,
-# and publishes the output (poses, point clouds, maps) to respective exchanges.
+# This script serves as the entry point for the SLAM3R Docker service, orchestrating
+# the entire 3D reconstruction pipeline. It continuously listens for incoming RGB image
+# frames from a RabbitMQ message queue, processes them using the SLAM3R (Simultaneous
+# Localization and Mapping with 3D Reconstruction) engine, and then publishes the
+# resulting outputs—such as camera poses, 3D point clouds, and incremental map updates—
+# to designated RabbitMQ exchanges for consumption by other services (e.g., visualization tools).
 #
-# Prompts influencing this file:
-# - Initial: RabbitMQ integration, SLAM3R model handling, desired outputs for visualization,
-#   full implementation of processing logic, SLAM3R_engine imports.
-# - "change the hugging face model download to use the models downloaded in image build in @Dockerfile":
-#   Modified Hugging Face model loading to use pre-downloaded models via IDs from the Docker image's cache.
-# - "What is the issue? If you don't know add logs" and subsequent logs analysis:
-#   1. Added logging to diagnose a TypeError in image preprocessing.
-#   2. Modified `load_camera_intrinsics` to ensure camera intrinsic parameters (fx, fy, cx, cy)
-#      are converted to floats upon loading, resolving the initial TypeError.
-#   3. Further modified `load_camera_intrinsics` to strip whitespace from intrinsic parameter strings
-#      before float conversion, to handle ValueError caused by extraneous characters in the YAML file.
+# Data Flow:
+# 1. Input: RGB image frames and associated metadata (e.g., timestamps) are consumed
+#    from the 'VIDEO_FRAMES_EXCHANGE_IN' RabbitMQ exchange. A 'RESTART_EXCHANGE_IN'
+#    allows for resetting the SLAM system state.
+# 2. Preprocessing: Incoming images are decoded, resized to a target resolution
+#    (e.g., 640x480), and converted to RGB. Camera intrinsics, if provided, are
+#    loaded and adjusted for the resized images. Images are then normalized and
+#    converted to PyTorch tensors.
+# 3. SLAM3R Processing:
+#    a. Initialization: For a new session, an initial set of frames is buffered.
+#       Image tokens (features) are extracted using the Image2Points (I2P) model's encoder.
+#       These frames are used to initialize the SLAM scene via `slam3r_initialize_scene`,
+#       which generates initial 3D point clouds in a common world frame. An initial
+#       keyframe stride can be adapted using `slam3r_adapt_keyframe_stride`.
+#       The quality of this initial map is checked against configurable thresholds.
+#    b. Incremental Processing: For subsequent frames:
+#       i. Image Token Extraction: Features are extracted using `slam3r_get_img_tokens`.
+#       ii. Local Reconstruction (I2P): The `i2p_inference_batch` function, using the
+#          Image2PointsModel, processes the current frame along with a recent keyframe
+#          to generate a local 3D point cloud (pts3d_cam) and confidence scores.
+#       iii. Global Registration (L2W): Relevant keyframes from the history are selected
+#          using `slam3r_scene_frame_retrieve`. The `l2w_inference` function, using
+#          the Local2WorldModel, registers the current frame's local point cloud
+#          into the global world coordinate system, yielding `pts3d_world` and a refined pose.
+#       iv. Pose Estimation: A rigid transformation (rotation matrix and translation vector)
+#           representing the camera's pose in the world frame is estimated using SVD
+#           (`estimate_rigid_transform_svd`) from corresponding local and world points.
+#       v. Keyframe Selection: Frames meeting certain criteria (e.g., stride-based)
+#          are designated as new keyframes and added to the history.
+# 4. Output:
+#    - Camera Poses: Published to 'SLAM3R_POSE_EXCHANGE_OUT', including position
+#      (x,y,z) and orientation (quaternion x,y,z,w), along with the raw 4x4 pose matrix.
+#    - Point Clouds: Incremental point clouds (current frame's world points) are
+#      published to 'SLAM3R_POINTCLOUD_EXCHANGE_OUT'.
+#    - Reconstruction Visualization: Data for visualizing the reconstruction (e.g.,
+#      newly added world points, keyframe ID) is published to
+#      'SLAM3R_RECONSTRUCTION_VIS_EXCHANGE_OUT'.
+#
+# Models Used:
+# - Image2PointsModel (I2P): Pre-trained model (e.g., "siyan824/slam3r_i2p" from
+#   Hugging Face) responsible for lifting 2D image features to local 3D point clouds.
+#   It typically consists of an image encoder and a depth/point prediction head.
+# - Local2WorldModel (L2W): Pre-trained model (e.g., "siyan824/slam3r_l2w" from
+#   Hugging Face) responsible for aligning local point clouds/features from new frames
+#   with existing keyframes in the global map, enabling robust tracking and global
+#   consistency.
+#
+# Core Imports Purpose:
+# - asyncio, aio_pika: For asynchronous operations, particularly RabbitMQ communication.
+# - os: Accessing environment variables for configuration.
+# - json: Serializing/deserializing data for RabbitMQ messages.
+# - logging: Recording operational information, warnings, and errors.
+# - cv2 (OpenCV): Image decoding, resizing, and color space conversions.
+# - numpy: Numerical operations, especially for matrix manipulations in pose estimation
+#   and point cloud handling.
+# - datetime, time: Timestamping and performance measurement.
+# - torch (PyTorch): Core deep learning framework for loading models, tensor operations,
+#   and running inference on CPU/GPU.
+# - yaml: Loading configuration files (e.g., SLAM3R parameters, camera intrinsics).
+# - shutil, requests, pathlib: File system and HTTP utilities (less central to core loop).
+# - torchvision.transforms: Standard PyTorch image transformations (though custom
+#   preprocessing is mainly used here).
 
 import asyncio
 import os
@@ -31,6 +85,9 @@ from pathlib import Path
 import time
 from torchvision import transforms # Added for potential future use with SLAM3R utils
 
+# Rerun import
+import rerun as rr
+
 # Configure logging (Moved Up)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -39,15 +96,17 @@ logger = logging.getLogger(__name__)
 SLAM3R_ENGINE_AVAILABLE = False
 try:
     # Imports from SLAM3R_engine.recon (similar to SLAM3R_engine/app.py)
+    # These functions form the core building blocks of the SLAM3R reconstruction pipeline.
     from SLAM3R_engine.recon import (
-        get_img_tokens as slam3r_get_img_tokens,
-        initialize_scene as slam3r_initialize_scene,
-        adapt_keyframe_stride as slam3r_adapt_keyframe_stride,
-        i2p_inference_batch,
-        l2w_inference,
-        scene_frame_retrieve as slam3r_scene_frame_retrieve
+        get_img_tokens as slam3r_get_img_tokens,         # Extracts feature tokens from images.
+        initialize_scene as slam3r_initialize_scene,     # Initializes the SLAM map from initial frames.
+        adapt_keyframe_stride as slam3r_adapt_keyframe_stride, # Dynamically adjusts keyframe selection rate.
+        i2p_inference_batch,                             # Performs Image-to-Points model inference.
+        l2w_inference,                                   # Performs Local-to-World model inference.
+        scene_frame_retrieve as slam3r_scene_frame_retrieve # Selects relevant keyframes for L2W.
     )
     # Imports from SLAM3R_engine.slam3r.models
+    # These are the PyTorch model classes for the I2P and L2W networks.
     from SLAM3R_engine.slam3r.models import Image2PointsModel, Local2WorldModel
     
     # Optional: If SLAM3R's specific image transformation is needed for better alignment
@@ -57,70 +116,91 @@ try:
     logger.info("Successfully imported SLAM3R engine components from SLAM3R_engine.")
 except ImportError as e:
     logger.error(f"Failed to import SLAM3R engine components: {e}. SLAM3R processing will be disabled. Ensure SLAM3R_engine is in the PYTHONPATH and all dependencies are installed.")
-    # Define dummy functions or classes if engine is not available to prevent NameErrors
-    # The SLAM3R_ENGINE_AVAILABLE flag should primarily guard against their use.
-    def slam3r_get_img_tokens(*args, **kwargs): raise NotImplementedError("SLAM3R engine not available due to import error")
-    def slam3r_initialize_scene(*args, **kwargs): raise NotImplementedError("SLAM3R engine not available due to import error")
-    def slam3r_adapt_keyframe_stride(*args, **kwargs): raise NotImplementedError("SLAM3R engine not available due to import error")
-    def i2p_inference_batch(*args, **kwargs): raise NotImplementedError("SLAM3R engine not available due to import error")
-    def l2w_inference(*args, **kwargs): raise NotImplementedError("SLAM3R engine not available due to import error")
-    def slam3r_scene_frame_retrieve(*args, **kwargs): raise NotImplementedError("SLAM3R engine not available due to import error")
-    class Image2PointsModel:
-        @staticmethod
-        def from_pretrained(path): raise NotImplementedError("SLAM3R engine not available due to import error")
-    class Local2WorldModel:
-        @staticmethod
-        def from_pretrained(path): raise NotImplementedError("SLAM3R engine not available due to import error")
+    raise e
 
 # --- Environment Variables ---
+# These variables configure the connection to RabbitMQ, exchange names,
+# paths to model checkpoints and configuration files, and image processing parameters.
+
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://rabbitmq")
+# Input RabbitMQ exchange for receiving video frames.
 VIDEO_FRAMES_EXCHANGE_IN = os.getenv("VIDEO_FRAMES_EXCHANGE", "video_frames_exchange")
+# Input RabbitMQ exchange for receiving restart commands.
 RESTART_EXCHANGE_IN = os.getenv("RESTART_EXCHANGE", "restart_exchange")
 
+# Output RabbitMQ exchange for publishing estimated camera poses.
 SLAM3R_POSE_EXCHANGE_OUT = os.getenv("SLAM3R_POSE_EXCHANGE", "slam3r_pose_exchange")
+# Output RabbitMQ exchange for publishing generated point clouds.
 SLAM3R_POINTCLOUD_EXCHANGE_OUT = os.getenv("SLAM3R_POINTCLOUD_EXCHANGE", "slam3r_pointcloud_exchange")
+# Output RabbitMQ exchange for publishing reconstruction visualization updates.
 SLAM3R_RECONSTRUCTION_VIS_EXCHANGE_OUT = os.getenv("SLAM3R_RECONSTRUCTION_VIS_EXCHANGE", "slam3r_reconstruction_vis_exchange")
 
+# Directory where SLAM3R model checkpoints are stored (though Hugging Face cache is primary).
 CHECKPOINTS_DIR = os.getenv("SLAM3R_CHECKPOINTS_DIR", "/checkpoints_mount")
-SLAM3R_CONFIG_FILE_PATH_IN_CONTAINER = os.getenv("SLAM3R_CONFIG_FILE", "/app/SLAM3R_engine/configs/wild.yaml") # Default path to SLAM3R config
-CAMERA_INTRINSICS_FILE_PATH = os.getenv("CAMERA_INTRINSICS_FILE", "/app/SLAM3R_engine/configs/camera_intrinsics.yaml") # Path to camera intrinsics YAML
+# Path to the SLAM3R configuration YAML file within the container.
+SLAM3R_CONFIG_FILE_PATH_IN_CONTAINER = os.getenv("SLAM3R_CONFIG_FILE", "/app/SLAM3R_engine/configs/wild.yaml")
+# Path to the camera intrinsics YAML file.
+CAMERA_INTRINSICS_FILE_PATH = os.getenv("CAMERA_INTRINSICS_FILE", "/app/SLAM3R_engine/configs/camera_intrinsics.yaml")
 
 # Image Processing Config
-TARGET_IMAGE_WIDTH = int(os.getenv("TARGET_IMAGE_WIDTH", "640")) # Width SLAM3R expects
-TARGET_IMAGE_HEIGHT = int(os.getenv("TARGET_IMAGE_HEIGHT", "480")) # Height SLAM3R expects
+# Target width for image preprocessing, expected by SLAM3R models.
+TARGET_IMAGE_WIDTH = int(os.getenv("TARGET_IMAGE_WIDTH", "640"))
+# Target height for image preprocessing, expected by SLAM3R models.
+TARGET_IMAGE_HEIGHT = int(os.getenv("TARGET_IMAGE_HEIGHT", "480"))
 
 # --- Initialization Quality Thresholds ---
-# These thresholds are used to check the quality of the initial SLAM map.
-# If the initial map quality is below these, initialization will be re-attempted.
-# Setting defaults to 0 to effectively bypass the check for initial experiments.
+# These thresholds determine if the initial SLAM map quality is sufficient.
+# If not, the system will attempt to re-initialize.
+# Minimum average confidence of points in the initial map.
 INITIALIZATION_QUALITY_MIN_AVG_CONFIDENCE = float(os.getenv("INITIALIZATION_QUALITY_MIN_AVG_CONFIDENCE", "0.0"))
+# Minimum total number of valid points in the initial map.
 INITIALIZATION_QUALITY_MIN_TOTAL_VALID_POINTS = int(os.getenv("INITIALIZATION_QUALITY_MIN_TOTAL_VALID_POINTS", "0"))
 
 # --- SLAM3R Global State ---
-slam_system = None
-is_slam_system_initialized = False
-camera_intrinsics_dict = None
-device = None
+# These variables hold the global state of the SLAM system, including models,
+# parameters, and data buffers that persist across frame processing.
+
+slam_system = None # Placeholder for a potential integrated SLAM system object (not currently used).
+is_slam_system_initialized = False # Flag indicating if models and parameters are loaded.
+camera_intrinsics_dict = None # Stores loaded camera intrinsic parameters.
+device = None # PyTorch device (CUDA or CPU) for model inference.
 
 # SLAM3R specific models and state
-i2p_model = None
-l2w_model = None
-slam_params = {} # To store parameters from SLAM3R config YAML
+i2p_model = None # The loaded Image2Points model.
+l2w_model = None # The loaded Local2World model.
+slam_params = {} # Dictionary to store parameters loaded from the SLAM3R config YAML.
 
-# Per-session SLAM state (needs reset on restart)
-processed_frames_history = [] # Stores dicts of { 'img_tensor', 'img_tokens', 'true_shape', 'img_pos', 'pts3d_cam', 'conf_cam', 'pts3d_world', 'conf_world', 'timestamp_ns', 'keyframe_id', 'raw_pose_matrix' }
-keyframe_indices = [] # Indices into processed_frames_history that are keyframes
-world_point_cloud_buffer = [] # Aggregated world points (e.g., list of [x,y,z] points)
-current_frame_index = 0 # Incremental index for incoming frames
-is_slam_initialized_for_session = False # Tracks if initial scene setup is done for current session
-slam_initialization_buffer = [] # Buffer for frames during initial SLAM setup
-reference_view_id_current_session = 0 # Reference view ID for current SLAM session
-active_kf_stride = 1 # Current keyframe stride, might be adapted
+# Per-session SLAM state (these are reset upon receiving a restart command)
+# History of processed frames, storing tensors, tokens, points, poses, etc.
+processed_frames_history = []
+# List of indices into processed_frames_history that correspond to keyframes.
+keyframe_indices = []
+# Buffer accumulating 3D points in the world coordinate system.
+world_point_cloud_buffer = []
+# Monotonically increasing index for incoming frames within a session.
+current_frame_index = 0
+# Flag indicating if the SLAM scene has been successfully initialized for the current session.
+is_slam_initialized_for_session = False
+# Temporary buffer to hold frames during the initial SLAM setup phase.
+slam_initialization_buffer = []
+# Reference view ID determined during SLAM session initialization.
+reference_view_id_current_session = 0
+# Current keyframe stride, which might be dynamically adapted.
+active_kf_stride = 1
+
+# Global flag to indicate if Rerun is connected
+rerun_connected = False
 
 # Transformation utilities
 def matrix_to_quaternion(matrix_3x3):
     """
     Convert a 3x3 rotation matrix to a quaternion (x, y, z, w).
+
+    Args:
+        matrix_3x3 (np.ndarray or list of lists): The 3x3 rotation matrix.
+
+    Returns:
+        np.ndarray: A 4-element numpy array representing the quaternion [x, y, z, w].
     """
     # Ensure matrix is numpy array
     m = np.asarray(matrix_3x3)
@@ -157,13 +237,18 @@ def matrix_to_quaternion(matrix_3x3):
 def estimate_rigid_transform_svd(points_src_np, points_tgt_np):
     """
     Estimates the rigid transformation (Rotation R, Translation t) from points_src to points_tgt
-    such that: points_tgt = R @ points_src + t
+    such that: points_tgt = R @ points_src + t. This is often used for aligning point clouds
+    or determining camera pose from 3D-3D correspondences.
+
     Args:
-        points_src_np (np.ndarray): Source points (N, 3).
-        points_tgt_np (np.ndarray): Target points (N, 3), corresponding to points_src_np.
+        points_src_np (np.ndarray): Source points, shape (N, 3).
+        points_tgt_np (np.ndarray): Target points, shape (N, 3), corresponding to points_src_np.
+
     Returns:
-        Tuple[np.ndarray, np.ndarray]: (R, t) where R is (3,3) rotation matrix, t is (3,1) translation vector.
-                                       Returns (np.eye(3), np.zeros((3,1))) on failure.
+        Tuple[np.ndarray, np.ndarray]:
+            - R (np.ndarray): The estimated 3x3 rotation matrix.
+            - t (np.ndarray): The estimated 3x1 translation vector.
+        Returns (np.eye(3), np.zeros((3,1))) if estimation is not possible (e.g., insufficient points).
     """
     if points_src_np.shape[0] < 3 or points_src_np.shape != points_tgt_np.shape:
         logger.warning(f"Not enough points or mismatched shapes for SVD-based pose estimation. Src: {points_src_np.shape}, Tgt: {points_tgt_np.shape}. Returning identity.")
@@ -199,13 +284,35 @@ def estimate_rigid_transform_svd(points_src_np, points_tgt_np):
     return R, t
 
 def pose_to_dict(position_np, orientation_quat_np):
+    """
+    Converts numpy arrays for position and quaternion orientation into a dictionary format.
+
+    Args:
+        position_np (np.ndarray): A 3-element numpy array for position [x, y, z].
+        orientation_quat_np (np.ndarray): A 4-element numpy array for quaternion [x, y, z, w].
+
+    Returns:
+        dict: A dictionary containing 'position' and 'orientation' keys,
+              each with nested 'x', 'y', 'z' (and 'w' for orientation) float values.
+    """
     return {
         "position": {"x": float(position_np[0]), "y": float(position_np[1]), "z": float(position_np[2])},
         "orientation": {"x": float(orientation_quat_np[0]), "y": float(orientation_quat_np[1]), "z": float(orientation_quat_np[2]), "w": float(orientation_quat_np[3])}
     }
 
 def load_camera_intrinsics(file_path):
-    """Loads camera intrinsics from a YAML file."""
+    """Loads camera intrinsics from a YAML file.
+
+    The YAML file is expected to contain 'fx', 'fy', 'cx', 'cy' keys
+    representing the focal lengths and principal point coordinates.
+
+    Args:
+        file_path (str): The path to the YAML file containing camera intrinsics.
+
+    Returns:
+        dict or None: A dictionary with 'fx', 'fy', 'cx', 'cy' as float values
+                      if successful, otherwise None.
+    """
     try:
         with open(file_path, 'r') as f:
             intrinsics = yaml.safe_load(f)
@@ -236,11 +343,46 @@ def load_camera_intrinsics(file_path):
         return None
 
 async def initialize_slam_system():
-    """Loads SLAM3R models and initializes the SLAM system."""
+    """
+    Initializes the SLAM3R system by loading models, configurations, and resetting session state.
+    This function is called at startup and upon receiving a restart command. It sets up
+    the Image2Points (I2P) and Local2World (L2W) models, loads SLAM parameters from a
+    configuration file, and prepares global state variables for a new SLAM session.
+
+    Global variables modified:
+        - slam_system, is_slam_system_initialized, camera_intrinsics_dict, device
+        - i2p_model, l2w_model, slam_params
+        - processed_frames_history, keyframe_indices, world_point_cloud_buffer
+        - current_frame_index, is_slam_initialized_for_session, slam_initialization_buffer,
+        - reference_view_id_current_session, active_kf_stride
+        - rerun_connected
+
+    Returns:
+        bool: True if initialization was successful or system was already initialized,
+              False otherwise.
+    """
     global slam_system, is_slam_system_initialized, camera_intrinsics_dict, device
     global i2p_model, l2w_model, slam_params
     global processed_frames_history, keyframe_indices, world_point_cloud_buffer
-    global current_frame_index, is_slam_initialized_for_session, slam_initialization_buffer, reference_view_id_current_session, active_kf_stride
+    global current_frame_index, is_slam_initialized_for_session, slam_initialization_buffer
+    global reference_view_id_current_session, active_kf_stride
+    global rerun_connected
+    
+    if os.getenv("RERUN_ENABLED", "true").lower() == "true" and not rerun_connected:
+        try:
+            rr.init("SLAM3R_Processor", spawn=False)
+            viewer_address = os.getenv("RERUN_CONNECT_URL", "rerun+http://127.0.0.1:9876/proxy")
+            logger.info(f"Attempting to connect to Rerun viewer via gRPC at: {viewer_address}")
+            rr.connect_grpc(viewer_address)
+            # Standard Z up, Y left, X forward for many 3D systems. Adjust if SLAM3R output is different.
+            # Or use OpenCV convention: X right, Y down, Z forward
+            rr.log_view_coordinates("world", up="+Y", right="-X", forward="-Z", timeless=True) # Typical for OpenCV / robotics
+            # rr.log_view_coordinates("world", up="+Z", right="+X", forward="+Y", timeless=True) # Alternative common view
+            logger.info("Successfully connected to Rerun viewer.")
+            rerun_connected = True
+        except Exception as e_rerun:
+            logger.error(f"Failed to initialize or connect to Rerun: {e_rerun}. Rerun visualization will be disabled.")
+            rerun_connected = False
     
     if not SLAM3R_ENGINE_AVAILABLE:
         logger.error("SLAM3R Engine components are not available. Cannot initialize SLAM system.")
@@ -332,7 +474,24 @@ async def initialize_slam_system():
     return is_slam_system_initialized
 
 def preprocess_image(image_np, target_width, target_height, intrinsics=None):
-    """Preprocesses the image for SLAM3R."""
+    """
+    Preprocesses an input image (numpy array) for SLAM3R processing.
+    This involves resizing, color conversion (BGR to RGB), normalization,
+    and conversion to a PyTorch tensor. It also adjusts camera intrinsics
+    if provided, to match the new image dimensions.
+
+    Args:
+        image_np (np.ndarray): The input image in BGR format (H, W, C).
+        target_width (int): The desired width for the processed image.
+        target_height (int): The desired height for the processed image.
+        intrinsics (dict, optional): Original camera intrinsics {'fx', 'fy', 'cx', 'cy'}.
+                                     If provided, they will be scaled to the target dimensions.
+
+    Returns:
+        Tuple[torch.Tensor, dict or None]:
+            - torch.Tensor: The preprocessed image tensor (C, H, W), scaled to [0,1], on the configured device.
+            - dict or None: Adjusted camera intrinsics if input intrinsics were provided, else None.
+    """
     # Resize
     height, width, _ = image_np.shape
     resized_img = cv2.resize(image_np, (target_width, target_height))
@@ -371,10 +530,43 @@ def preprocess_image(image_np, target_width, target_height, intrinsics=None):
     return img_tensor.to(device), adjusted_intrinsics # Return tensor and dict for now
 
 async def process_image_with_slam3r(image_np, timestamp_ns, headers):
-    """Processes an image with the initialized SLAM3R system and returns outputs."""
+    """
+    Core function to process a single image frame using the SLAM3R pipeline.
+    This function handles:
+    1. Image preprocessing.
+    2. SLAM session initialization (if not already done) using a buffer of initial frames.
+       This includes feature extraction, scene initialization with I2P, and quality checks.
+    3. Incremental SLAM processing for subsequent frames:
+       - Feature (token) extraction via `slam3r_get_img_tokens`.
+       - Local point cloud generation using Image2Points model (`i2p_inference_batch`).
+       - Global registration and pose refinement using Local2World model (`l2w_inference`),
+         leveraging selected keyframes (`slam3r_scene_frame_retrieve`).
+       - Pose estimation from 3D-3D correspondences (`estimate_rigid_transform_svd`).
+       - Keyframe selection and updating the world point cloud buffer.
+    4. Formatting and returning pose data, point cloud data, and reconstruction updates.
+
+    Args:
+        image_np (np.ndarray): The input image as a NumPy array (BGR format).
+        timestamp_ns (int): Timestamp of the image in nanoseconds.
+        headers (dict): Headers from the RabbitMQ message, potentially containing metadata.
+
+    Global variables accessed/modified:
+        - i2p_model, l2w_model, slam_params, camera_intrinsics_dict, device
+        - processed_frames_history, keyframe_indices, world_point_cloud_buffer
+        - current_frame_index, is_slam_initialized_for_session, slam_initialization_buffer,
+        - reference_view_id_current_session, active_kf_stride
+
+    Returns:
+        Tuple[dict, dict, dict] or Tuple[None, None, None]:
+            - pose_data (dict): Estimated camera pose.
+            - point_cloud_data (dict): Generated 3D point cloud for the current frame.
+            - reconstruction_update_data (dict): Incremental update for visualization.
+            Returns (None, None, None) if processing fails or system is not initialized.
+    """
     global i2p_model, l2w_model, slam_params, camera_intrinsics_dict, device
     global processed_frames_history, keyframe_indices, world_point_cloud_buffer
-    global current_frame_index, is_slam_initialized_for_session, slam_initialization_buffer, reference_view_id_current_session, active_kf_stride
+    global current_frame_index, is_slam_initialized_for_session, slam_initialization_buffer
+    global reference_view_id_current_session, active_kf_stride
 
     start_time = time.time()
 
@@ -391,6 +583,32 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
             camera_intrinsics_dict 
         )
         preprocessed_image_tensor = preprocessed_image_tensor.to(device)
+
+        if rerun_connected:
+            try:
+                # Log RGB image (convert BGR to RGB)
+                rgb_image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+                rr.log_image("world/camera/image", rgb_image_np)
+
+                # Log Camera Intrinsics if available
+                if current_frame_intrinsics:
+                    fx = current_frame_intrinsics['fx']
+                    fy = current_frame_intrinsics['fy']
+                    cx = current_frame_intrinsics['cx']
+                    cy = current_frame_intrinsics['cy']
+                    intrinsics_matrix = np.array([
+                        [fx, 0, cx],
+                        [0, fy, cy],
+                        [0, 0, 1]
+                    ])
+                    rr.log_pinhole(
+                        "world/camera",
+                        child_from_parent=intrinsics_matrix,
+                        width=TARGET_IMAGE_WIDTH,
+                        height=TARGET_IMAGE_HEIGHT
+                    )
+            except Exception as e_rerun_img_intr:
+                logger.warning(f"Rerun: Error logging image or intrinsics: {e_rerun_img_intr}")
 
         # Prepare view dict as expected by SLAM3R utils (based on recon.py and app.py)
         # The 'img' tensor for SLAM3R is typically CHW, no batch dim for single processing then batched by utils.
@@ -862,6 +1080,27 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
                         frame_data_for_history['keyframe_id'] = f"kf_{len(keyframe_indices)-1}"
                         keyframe_id_for_output = frame_data_for_history['keyframe_id']
                         logger.info(f"Frame {current_frame_index} selected as Keyframe {frame_data_for_history['keyframe_id']}. Total KFs: {len(keyframe_indices)}")
+                        if rerun_connected:
+                            try:
+                                rr.log_text_entry("log/info", text=f"Keyframe {frame_data_for_history['keyframe_id']} added at frame {current_frame_index}", color=[0, 255, 0])
+                                # Log keyframe pose distinctly if desired
+                                kf_pose_matrix = np.array(frame_data_for_history['raw_pose_matrix'])
+                                kf_position = kf_pose_matrix[:3, 3]
+                                kf_orientation_m = kf_pose_matrix[:3,:3]
+                                kf_orientation_q = matrix_to_quaternion(kf_orientation_m) # x,y,z,w
+
+                                rr.log_transform3d(
+                                    f"world/keyframes/{frame_data_for_history['keyframe_id']}",
+                                    transform=rr.TranslationRotationScale3D(
+                                        translation=kf_position,
+                                        rotation=rr.Quaternion(xyzw=kf_orientation_q)
+                                    )
+                                )
+                                rr.log_point(f"world/keyframes/{frame_data_for_history['keyframe_id']}/center", position=[0,0,0], radius=0.02, color=[255,255,0])
+
+
+                            except Exception as e_rerun_kf:
+                                logger.warning(f"Rerun: Error logging keyframe info: {e_rerun_kf}")
         
         # Update history and index
         processed_frames_history.append(frame_data_for_history)
@@ -872,14 +1111,48 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
         current_pose_matrix_list = frame_data_for_history.get('raw_pose_matrix', np.eye(4).tolist())
         current_pose_matrix_np = np.array(current_pose_matrix_list)
         
-        position = current_pose_matrix_np[:3, 3]
-        orientation_q = matrix_to_quaternion(current_pose_matrix_np[:3,:3]) # x,y,z,w
+        position_np_arr = current_pose_matrix_np[:3, 3]
+        orientation_m = current_pose_matrix_np[:3,:3]
+        orientation_q_xyzw = matrix_to_quaternion(orientation_m) # x,y,z,w
+
+        if rerun_connected:
+            try:
+                # Log current camera pose
+                rr.log_transform3d(
+                    "world/camera",
+                    transform=rr.TranslationRotationScale3D(
+                        translation=position_np_arr,
+                        rotation=rr.Quaternion(xyzw=orientation_q_xyzw)
+                    )
+                )
+
+                # Log local points (from I2P, in camera frame)
+                if frame_data_for_history['pts3d_cam'] is not None and frame_data_for_history['conf_cam'] is not None:
+                    local_pts_tensor_viz = frame_data_for_history['pts3d_cam'].squeeze(0).cpu() # H,W,3 or N,3
+                    local_conf_tensor_viz = frame_data_for_history['conf_cam'].squeeze(0).cpu() # H,W or N
+                    
+                    P_local_np_viz = local_pts_tensor_viz.reshape(-1, 3).numpy()
+                    C_local_np_viz = local_conf_tensor_viz.reshape(-1).numpy()
+                    
+                    conf_i2p_viz = slam_params.get('conf_thres_i2p', 1.5)
+                    valid_mask_local_viz = C_local_np_viz > conf_i2p_viz
+                    
+                    if np.any(valid_mask_local_viz):
+                        P_local_filtered_viz = P_local_np_viz[valid_mask_local_viz]
+                        rr.log_points("world/camera/local_scan", P_local_filtered_viz, colors=[255, 0, 255], radii=0.005) # Magenta for local scan
+
+                # Log incremental world points (from L2W)
+                if temp_points_xyz_list: # This list contains newly added world points
+                    rr.log_points("world/points", np.array(temp_points_xyz_list), colors=[0, 0, 255], radii=0.007) # Blue for world points
+            
+            except Exception as e_rerun_dynamic:
+                logger.warning(f"Rerun: Error logging dynamic data (pose/points): {e_rerun_dynamic}")
 
         pose_data = {
             "timestamp_ns": timestamp_ns,
             "processing_timestamp": str(datetime.now().timestamp()),
-            "position": {"x": float(position[0]), "y": float(position[1]), "z": float(position[2])},
-            "orientation": {"x": float(orientation_q[0]), "y": float(orientation_q[1]), "z": float(orientation_q[2]), "w": float(orientation_q[3])},
+            "position": {"x": float(position_np_arr[0]), "y": float(position_np_arr[1]), "z": float(position_np_arr[2])},
+            "orientation": {"x": float(orientation_q_xyzw[0]), "y": float(orientation_q_xyzw[1]), "z": float(orientation_q_xyzw[2]), "w": float(orientation_q_xyzw[3])},
             "raw_pose_matrix": current_pose_matrix_list
         }
         
@@ -914,7 +1187,17 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
         return None, None, None
 
 async def on_video_frame_message(message: aio_pika.IncomingMessage, exchanges):
-    async with message.process():
+    """
+    Callback function to handle incoming video frame messages from RabbitMQ.
+    It decodes the image, processes it using `process_image_with_slam3r`,
+    and publishes the results (pose, point cloud, reconstruction update)
+    to their respective RabbitMQ exchanges.
+
+    Args:
+        message (aio_pika.IncomingMessage): The received RabbitMQ message.
+        exchanges (dict): A dictionary of declared RabbitMQ exchanges for publishing.
+    """
+    async with message.process(): # Acknowledges the message upon successful processing
         try:
             image_data = message.body
             headers = message.headers
@@ -962,10 +1245,30 @@ async def on_video_frame_message(message: aio_pika.IncomingMessage, exchanges):
             logger.error(f"Error processing video frame message: {e}", exc_info=True)
 
 async def on_restart_message(message: aio_pika.IncomingMessage):
+    """
+    Callback function to handle restart messages from RabbitMQ.
+    It triggers the re-initialization of the SLAM system by resetting global state
+    variables (including models, parameters, frame history, and session state)
+    and then calling `initialize_slam_system`. This allows for a clean restart
+    of the SLAM process without restarting the Docker container.
+
+    Args:
+        message (aio_pika.IncomingMessage): The received RabbitMQ restart message.
+
+    Global variables modified:
+        - is_slam_system_initialized, slam_system
+        - i2p_model, l2w_model, slam_params
+        - processed_frames_history, keyframe_indices, world_point_cloud_buffer
+        - current_frame_index, is_slam_initialized_for_session, slam_initialization_buffer,
+        - active_kf_stride, reference_view_id_current_session
+        - rerun_connected
+    """
     global is_slam_system_initialized, slam_system
-    global i2p_model, l2w_model, slam_params # Added SLAM3R specific models and params
+    global i2p_model, l2w_model, slam_params
     global processed_frames_history, keyframe_indices, world_point_cloud_buffer
-    global current_frame_index, is_slam_initialized_for_session, slam_initialization_buffer, active_kf_stride, reference_view_id_current_session
+    global current_frame_index, is_slam_initialized_for_session, slam_initialization_buffer
+    global active_kf_stride, reference_view_id_current_session
+    global rerun_connected
 
     async with message.process():
         try:
@@ -988,15 +1291,32 @@ async def on_restart_message(message: aio_pika.IncomingMessage):
             slam_initialization_buffer = []
             active_kf_stride = 1 # Reset to default or value from config
             reference_view_id_current_session = 0
+            
+            # Rerun connection status is not reset here, as init will try to reconnect.
+            # If a specific Rerun session reset is needed, rr.save() or re-init could be used.
+            # For now, keep existing connection or let initialize_slam_system handle re-connection.
 
             if device and device.type == 'cuda':
                 torch.cuda.empty_cache() # Clear CUDA cache
             
-            await initialize_slam_system() # This will reload models and parameters
+            # Re-initialize the SLAM system, which will also attempt to reconnect Rerun
+            await initialize_slam_system() 
         except Exception as e:
             logger.error(f"Error processing restart message: {e}", exc_info=True)
 
 async def main():
+    """
+    Main asynchronous function for the SLAM3R processor service.
+    It performs the following steps:
+    1. Initializes the SLAM system (`initialize_slam_system`).
+    2. Establishes a robust connection to RabbitMQ, with retries.
+    3. Declares necessary RabbitMQ exchanges (input and output).
+    4. Declares and binds queues for video frames and restart commands.
+    5. Starts consuming messages from these queues, assigning them to their
+       respective handler functions (`on_video_frame_message`, `on_restart_message`).
+    6. Keeps the service running indefinitely until interrupted.
+    7. Handles graceful shutdown by closing the RabbitMQ connection.
+    """
     # Initial attempt to load models and initialize system
     # This ensures that if RabbitMQ connection fails initially, we still try to load SLAM
     # so that subsequent restart messages or reconnections can use an initialized system.
@@ -1064,4 +1384,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("SLAM3R processor stopped by user.")
     except Exception as e:
+        # Critical log for unhandled exceptions at the top level, ensuring visibility.
         logger.critical(f"Unhandled exception in SLAM3R processor: {e}", exc_info=True) 
