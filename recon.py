@@ -10,6 +10,10 @@ import torch
 import matplotlib.pyplot as plt
 plt.ion()
 
+# --- Logging setup (reuse main app's logging config if present)
+import logging
+logger = logging.getLogger(__name__)
+
 from slam3r.datasets.wild_seq import Seq_Data
 from slam3r.models import Image2PointsModel, Local2WorldModel, inf
 from slam3r.utils.device import to_numpy
@@ -253,6 +257,19 @@ def initialize_scene(views:list, model:Image2PointsModel, winsize=5, conf_thres=
         output = i2p_inference_batch([window_views], model, ref_id=ref_id, 
                                     tocpu=True, unsqueeze=False)
         preds = output['preds']
+        # --- Debug logging: aggregate confidence statistics for this window/ref
+        try:
+            all_confs = np.concatenate([preds[j]['conf'].reshape(-1) for j in range(winsize)])
+            logger.info(
+                "I2P conf stats (win=%d, ref=%d): min=%.2f, max=%.2f, mean=%.2f",
+                winsize,
+                ref_id,
+                all_confs.min(),
+                all_confs.max(),
+                all_confs.mean(),
+            )
+        except Exception as e:
+            logger.warning("Unable to compute confidence statistics: %s", e)
         # choose the ref_id with the highest median confidence
         med_conf = np.array([preds[j]['conf'].mean() for j in range(winsize)]).mean()
         if med_conf > max_med_conf:
