@@ -88,6 +88,15 @@ from torchvision import transforms # Added for potential future use with SLAM3R 
 # Rerun import
 import rerun as rr
 
+def log_image_rr(path: str, img):
+    rr.log(path, rr.Image(img))
+
+def log_transform3d_rr(path: str, *, translation=None, rotation=None, scale=None):
+    rr.log(path, rr.Transform3D(translation=translation, rotation=rotation, scale=scale))
+
+def log_points_rr(path: str, positions, *, colors=None, radii=None):
+    rr.log(path, rr.Points3D(positions=positions, colors=colors, radii=radii))
+
 # Configure logging (Moved Up)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -152,9 +161,9 @@ TARGET_IMAGE_HEIGHT = int(os.getenv("TARGET_IMAGE_HEIGHT", "480"))
 # These thresholds determine if the initial SLAM map quality is sufficient.
 # If not, the system will attempt to re-initialize.
 # Minimum average confidence of points in the initial map.
-INITIALIZATION_QUALITY_MIN_AVG_CONFIDENCE = float(os.getenv("INITIALIZATION_QUALITY_MIN_AVG_CONFIDENCE", "0.0"))
+INITIALIZATION_QUALITY_MIN_AVG_CONFIDENCE = float(os.getenv("INITIALIZATION_QUALITY_MIN_AVG_CONFIDENCE", "1.0"))
 # Minimum total number of valid points in the initial map.
-INITIALIZATION_QUALITY_MIN_TOTAL_VALID_POINTS = int(os.getenv("INITIALIZATION_QUALITY_MIN_TOTAL_VALID_POINTS", "0"))
+INITIALIZATION_QUALITY_MIN_TOTAL_VALID_POINTS = int(os.getenv("INITIALIZATION_QUALITY_MIN_TOTAL_VALID_POINTS", "100"))
 
 # --- SLAM3R Global State ---
 # These variables hold the global state of the SLAM system, including models,
@@ -368,21 +377,59 @@ async def initialize_slam_system():
     global reference_view_id_current_session, active_kf_stride
     global rerun_connected
     
+    # ------------------------------------------------------------------
+    # Robust Rerun viewer connection (only attempted once per container)
+    # ------------------------------------------------------------------
     if os.getenv("RERUN_ENABLED", "true").lower() == "true" and not rerun_connected:
-        try:
-            rr.init("SLAM3R_Processor", spawn=False)
-            viewer_address = os.getenv("RERUN_CONNECT_URL", "rerun+http://127.0.0.1:9876/proxy")
-            logger.info(f"Attempting to connect to Rerun viewer via gRPC at: {viewer_address}")
-            rr.connect_grpc(viewer_address)
-            # Standard Z up, Y left, X forward for many 3D systems. Adjust if SLAM3R output is different.
-            # Or use OpenCV convention: X right, Y down, Z forward
-            rr.log_view_coordinates("world", up="+Y", right="-X", forward="-Z", timeless=True) # Typical for OpenCV / robotics
-            # rr.log_view_coordinates("world", up="+Z", right="+X", forward="+Y", timeless=True) # Alternative common view
-            logger.info("Successfully connected to Rerun viewer.")
-            rerun_connected = True
-        except Exception as e_rerun:
-            logger.error(f"Failed to initialize or connect to Rerun: {e_rerun}. Rerun visualization will be disabled.")
-            rerun_connected = False
+        rr.init("SLAM3R_Processor", spawn=False)
+
+        # Build a list of candidate URLs in order of preference.
+        candidate_urls: list[str] = []
+
+        # 1) Explicit env var (best‑effort)
+        env_connect_url = os.getenv("RERUN_CONNECT_URL")
+        if env_connect_url:
+            candidate_urls.append(env_connect_url)
+
+        # 2) If the user supplied a plain viewer address, derive the proxy URL.
+        env_viewer_addr = os.getenv("RERUN_VIEWER_ADDRESS")
+        if env_viewer_addr:
+            # If already in "rerun+http" form just keep it, otherwise convert.
+            if env_viewer_addr.startswith("rerun+"):
+                candidate_urls.append(env_viewer_addr)
+            else:
+                candidate_urls.append(f"rerun+http://{env_viewer_addr}/proxy")
+
+        # 3) Common docker-host fallbacks.
+        candidate_urls.extend([
+            "rerun+http://host.docker.internal:9876/proxy",
+            "rerun+http://127.0.0.1:9876/proxy",
+            "rerun+http://localhost:9876/proxy",
+        ])
+
+        logger.info(f"Attempting to connect to Rerun viewer. Candidate URLs: {candidate_urls}")
+
+        connected = False
+        for url in candidate_urls:
+            try:
+                logger.info(f"Trying Rerun gRPC connect: {url}")
+                print(f"Trying Rerun gRPC connect: {url}")
+                rr.connect_grpc(url, flush_timeout_sec=10.0)
+                logger.info(f"✅ Connected to Rerun viewer at {url}")
+                # Establish a canonical coordinate system once connected.
+                rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_UP, static=True)
+                demo_point_grid()  # quick sanity‑check visual
+                connected = True
+                break
+            except Exception as conn_err:
+                logger.warning(f"Connection failed for {url}: {conn_err}")
+
+        rerun_connected = connected
+        if not rerun_connected:
+            logger.error(
+                "❌ Unable to connect to any Rerun viewer instance. "
+                "Rerun visualization will be disabled for this session."
+            )
     
     if not SLAM3R_ENGINE_AVAILABLE:
         logger.error("SLAM3R Engine components are not available. Cannot initialize SLAM system.")
@@ -472,6 +519,27 @@ async def initialize_slam_system():
         logger.error(f"Failed to initialize SLAM3R system: {e}", exc_info=True)
         is_slam_system_initialized = False
     return is_slam_system_initialized
+
+# ---------------------------------------------------------------------------
+# Demo: coloured lattice so we can see data arriving in the viewer
+# ---------------------------------------------------------------------------
+def demo_point_grid(size: int = 10):
+    xs = np.linspace(-10, 10, size, dtype=np.float32)
+    positions = (
+        np.stack(np.meshgrid(xs, xs, xs), axis=-1)     # (size,size,size,3)
+        .reshape(-1, 3)                                # (N,3)
+    )
+
+    cs = np.linspace(0, 255, size, dtype=np.uint8)
+    colors = (
+        np.stack(np.meshgrid(cs, cs, cs), axis=-1)
+        .reshape(-1, 3)                                # (N,3)
+    )
+
+    # radii must be one‑per‑point (or None)
+    radii = np.full((positions.shape[0],), 0.5, dtype=np.float32)
+
+    log_points_rr("world/demo_point_grid", positions, colors=colors, radii=radii)
 
 def preprocess_image(image_np, target_width, target_height, intrinsics=None):
     """
@@ -585,30 +653,27 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
         preprocessed_image_tensor = preprocessed_image_tensor.to(device)
 
         if rerun_connected:
-            try:
-                # Log RGB image (convert BGR to RGB)
-                rgb_image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
-                rr.log_image("world/camera/image", rgb_image_np)
+            # Log RGB image (convert BGR to RGB)
+            rgb_image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+            rr.log_image("world/camera/image", rgb_image_np)
 
-                # Log Camera Intrinsics if available
-                if current_frame_intrinsics:
-                    fx = current_frame_intrinsics['fx']
-                    fy = current_frame_intrinsics['fy']
-                    cx = current_frame_intrinsics['cx']
-                    cy = current_frame_intrinsics['cy']
-                    intrinsics_matrix = np.array([
-                        [fx, 0, cx],
-                        [0, fy, cy],
-                        [0, 0, 1]
-                    ])
-                    rr.log_pinhole(
-                        "world/camera",
-                        child_from_parent=intrinsics_matrix,
-                        width=TARGET_IMAGE_WIDTH,
-                        height=TARGET_IMAGE_HEIGHT
-                    )
-            except Exception as e_rerun_img_intr:
-                logger.warning(f"Rerun: Error logging image or intrinsics: {e_rerun_img_intr}")
+            # Log Camera Intrinsics if available
+            if current_frame_intrinsics:
+                fx = current_frame_intrinsics['fx']
+                fy = current_frame_intrinsics['fy']
+                cx = current_frame_intrinsics['cx']
+                cy = current_frame_intrinsics['cy']
+                intrinsics_matrix = np.array([
+                    [fx, 0, cx],
+                    [0, fy, cy],
+                    [0, 0, 1]
+                ])
+                rr.log_pinhole(
+                    "world/camera",
+                    child_from_parent=intrinsics_matrix,
+                    width=TARGET_IMAGE_WIDTH,
+                    height=TARGET_IMAGE_HEIGHT
+                )
 
         # Prepare view dict as expected by SLAM3R utils (based on recon.py and app.py)
         # The 'img' tensor for SLAM3R is typically CHW, no batch dim for single processing then batched by utils.
@@ -1081,26 +1146,21 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
                         keyframe_id_for_output = frame_data_for_history['keyframe_id']
                         logger.info(f"Frame {current_frame_index} selected as Keyframe {frame_data_for_history['keyframe_id']}. Total KFs: {len(keyframe_indices)}")
                         if rerun_connected:
-                            try:
-                                rr.log_text_entry("log/info", text=f"Keyframe {frame_data_for_history['keyframe_id']} added at frame {current_frame_index}", color=[0, 255, 0])
-                                # Log keyframe pose distinctly if desired
-                                kf_pose_matrix = np.array(frame_data_for_history['raw_pose_matrix'])
-                                kf_position = kf_pose_matrix[:3, 3]
-                                kf_orientation_m = kf_pose_matrix[:3,:3]
-                                kf_orientation_q = matrix_to_quaternion(kf_orientation_m) # x,y,z,w
+                            rr.log_text_entry("log/info", text=f"Keyframe {frame_data_for_history['keyframe_id']} added at frame {current_frame_index}", color=[0, 255, 0])
+                            # Log keyframe pose distinctly if desired
+                            kf_pose_matrix = np.array(frame_data_for_history['raw_pose_matrix'])
+                            kf_position = kf_pose_matrix[:3, 3]
+                            kf_orientation_m = kf_pose_matrix[:3,:3]
+                            kf_orientation_q = matrix_to_quaternion(kf_orientation_m) # x,y,z,w
 
-                                rr.log_transform3d(
-                                    f"world/keyframes/{frame_data_for_history['keyframe_id']}",
-                                    transform=rr.TranslationRotationScale3D(
-                                        translation=kf_position,
-                                        rotation=rr.Quaternion(xyzw=kf_orientation_q)
-                                    )
+                            rr.log_transform3d(
+                                f"world/keyframes/{frame_data_for_history['keyframe_id']}",
+                                transform=rr.TranslationRotationScale3D(
+                                    translation=kf_position,
+                                    rotation=rr.Quaternion(xyzw=kf_orientation_q)
                                 )
-                                rr.log_point(f"world/keyframes/{frame_data_for_history['keyframe_id']}/center", position=[0,0,0], radius=0.02, color=[255,255,0])
-
-
-                            except Exception as e_rerun_kf:
-                                logger.warning(f"Rerun: Error logging keyframe info: {e_rerun_kf}")
+                            )
+                            rr.log_point(f"world/keyframes/{frame_data_for_history['keyframe_id']}/center", position=[0,0,0], radius=0.02, color=[255,255,0])
         
         # Update history and index
         processed_frames_history.append(frame_data_for_history)
@@ -1116,37 +1176,37 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
         orientation_q_xyzw = matrix_to_quaternion(orientation_m) # x,y,z,w
 
         if rerun_connected:
-            try:
-                # Log current camera pose
-                rr.log_transform3d(
-                    "world/camera",
-                    transform=rr.TranslationRotationScale3D(
-                        translation=position_np_arr,
-                        rotation=rr.Quaternion(xyzw=orientation_q_xyzw)
-                    )
+            # Log current camera pose
+            rr.log_transform3d(
+                "world/camera",
+                transform=rr.TranslationRotationScale3D(
+                    translation=position_np_arr,
+                    rotation=rr.Quaternion(xyzw=orientation_q_xyzw)
                 )
+            )
 
-                # Log local points (from I2P, in camera frame)
-                if frame_data_for_history['pts3d_cam'] is not None and frame_data_for_history['conf_cam'] is not None:
-                    local_pts_tensor_viz = frame_data_for_history['pts3d_cam'].squeeze(0).cpu() # H,W,3 or N,3
-                    local_conf_tensor_viz = frame_data_for_history['conf_cam'].squeeze(0).cpu() # H,W or N
-                    
-                    P_local_np_viz = local_pts_tensor_viz.reshape(-1, 3).numpy()
-                    C_local_np_viz = local_conf_tensor_viz.reshape(-1).numpy()
-                    
-                    conf_i2p_viz = slam_params.get('conf_thres_i2p', 1.5)
-                    valid_mask_local_viz = C_local_np_viz > conf_i2p_viz
-                    
-                    if np.any(valid_mask_local_viz):
-                        P_local_filtered_viz = P_local_np_viz[valid_mask_local_viz]
-                        rr.log_points("world/camera/local_scan", P_local_filtered_viz, colors=[255, 0, 255], radii=0.005) # Magenta for local scan
+            # Log local points (from I2P, in camera frame)
+            if frame_data_for_history['pts3d_cam'] is not None and frame_data_for_history['conf_cam'] is not None:
+                local_pts_tensor_viz = frame_data_for_history['pts3d_cam'].squeeze(0).cpu() # H,W,3 or N,3
+                local_conf_tensor_viz = frame_data_for_history['conf_cam'].squeeze(0).cpu() # H,W or N
+                
+                P_local_np_viz = local_pts_tensor_viz.reshape(-1, 3).numpy()
+                C_local_np_viz = local_conf_tensor_viz.reshape(-1).numpy()
+                
+                conf_i2p_viz = slam_params.get('conf_thres_i2p', 1.5)
+                valid_mask_local_viz = C_local_np_viz > conf_i2p_viz
+                
+                if np.any(valid_mask_local_viz):
+                    P_local_filtered_viz = P_local_np_viz[valid_mask_local_viz]
+                    rr.log_points("world/camera/local_scan", P_local_filtered_viz, colors=[255, 0, 255], radii=0.005) # Magenta for local scan
 
-                # Log incremental world points (from L2W)
-                if temp_points_xyz_list: # This list contains newly added world points
-                    rr.log_points("world/points", np.array(temp_points_xyz_list), colors=[0, 0, 255], radii=0.007) # Blue for world points
+            # Log incremental world points (from L2W)
+            if temp_points_xyz_list: # This list contains newly added world points
+                rr.log_points("world/points", np.array(temp_points_xyz_list), colors=[0, 0, 255], radii=0.007) # Blue for world points
             
-            except Exception as e_rerun_dynamic:
-                logger.warning(f"Rerun: Error logging dynamic data (pose/points): {e_rerun_dynamic}")
+            # The logger warning for dynamic data logging should remain if needed
+            # logger.warning(f"Rerun: Error logging dynamic data (pose/points): {e_rerun_dynamic}")
+            # Or remove the 'except' if the try block was fully removed. Assuming full removal:
 
         pose_data = {
             "timestamp_ns": timestamp_ns,
