@@ -876,6 +876,7 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
                             if i < len(initial_input_views_for_slam):
                                 processed_frames_history[history_idx]['img_tokens'] = initial_input_views_for_slam[i]['img_tokens']
                                 processed_frames_history[history_idx]['img_pos'] = initial_input_views_for_slam[i]['img_pos']
+                                processed_frames_history[history_idx]['true_shape'] = initial_input_views_for_slam[i]['true_shape']
                             else:
                                 logger.warning(f"Index {i} out of range for initial_input_views_for_slam (length {len(initial_input_views_for_slam)})")
 
@@ -957,6 +958,19 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
 
                 # i2p_inference_batch takes list_of_lists_of_views.
                 # ref_id is local to the inner list - we use 0 to set the keyframe as reference
+                # --- ensure each view carries a non‑None (H,W) tensor ---
+                # --- ensure each view carries a non‑None (H,W) tensor ---
+                for window in multiview_input:        # outer list = windows
+                    for v in window:                  # inner list = per‑view dicts
+                        if v.get("true_shape") is None:
+                            if "img" in v and isinstance(v["img"], torch.Tensor):
+                                h, w = v["img"].shape[-2:]
+                            else:                     # keyframes may have only tokens
+                                h, w = TARGET_IMAGE_HEIGHT, TARGET_IMAGE_WIDTH
+                            v["true_shape"] = torch.tensor([h, w],
+                                                        dtype=torch.int64,
+                                                        device=device)
+                        
                 i2p_output = i2p_inference_batch(multiview_input, i2p_model, ref_id=0, tocpu=False, unsqueeze=False)
             else:
                 logger.error("No keyframes available for I2P multi-view processing. Cannot process current frame.")
@@ -968,8 +982,8 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
             try:
                 # The structure is different now - we need to get the current view results, which is index 1
                 # [0] is the first batch, [1] is the current frame (second view)
-                current_pts3d_cam = i2p_output['preds'][0][1]['pts3d']  # Shape: (1, H, W, 3) or (1, N, 3)
-                current_conf_cam = i2p_output['preds'][0][1]['conf']    # Shape: (1, H, W) or (1, N)
+                current_pts3d_cam = i2p_output['preds'][1]['pts3d']  # Shape: (1, H, W, 3) or (1, N, 3)
+                current_conf_cam = i2p_output['preds']['conf']    # Shape: (1, H, W) or (1, N)
                 frame_data_for_history['pts3d_cam'] = current_pts3d_cam
                 frame_data_for_history['conf_cam'] = current_conf_cam
                 logger.info(f"Successfully processed I2P for frame {current_frame_index} with shape {current_pts3d_cam.shape}")
