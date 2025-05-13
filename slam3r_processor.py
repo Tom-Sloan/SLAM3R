@@ -56,8 +56,17 @@ CHECKPOINTS_DIR                    = os.getenv("SLAM3R_CHECKPOINTS_DIR", "/check
 SLAM3R_CONFIG_FILE_PATH_IN_CONTAINER= os.getenv("SLAM3R_CONFIG_FILE", "/app/SLAM3R_engine/configs/wild.yaml")
 CAMERA_INTRINSICS_FILE_PATH        = os.getenv("CAMERA_INTRINSICS_FILE", "/app/SLAM3R_engine/configs/camera_intrinsics.yaml")
 
-TARGET_IMAGE_WIDTH  = int(os.getenv("TARGET_IMAGE_WIDTH",  "640"))
-TARGET_IMAGE_HEIGHT = int(os.getenv("TARGET_IMAGE_HEIGHT", "480"))
+
+# Models were trained on 224 × 224 crops ─ keep that as the canonical default.
+DEFAULT_MODEL_INPUT_RESOLUTION = 224
+# How many <ref,src> windows to batch together for the I2P forward pass
+# (set > 1 to enable lightweight batching without touching the outer loop).
+INFERENCE_WINDOW_BATCH = int(os.getenv("SLAM3R_INFERENCE_BATCH", "1"))
+
+TARGET_IMAGE_WIDTH  = int(os.getenv("TARGET_IMAGE_WIDTH",
+                                    str(DEFAULT_MODEL_INPUT_RESOLUTION)))
+TARGET_IMAGE_HEIGHT = int(os.getenv("TARGET_IMAGE_HEIGHT",
+                                    str(DEFAULT_MODEL_INPUT_RESOLUTION)))
 
 INIT_QUALITY_MIN_CONF   = float(os.getenv("INITIALIZATION_QUALITY_MIN_AVG_CONFIDENCE", "1.0"))
 INIT_QUALITY_MIN_POINTS = int  (os.getenv("INITIALIZATION_QUALITY_MIN_TOTAL_VALID_POINTS", "100"))
@@ -142,6 +151,13 @@ def log_points_to_rerun(label: str, xyz: np.ndarray, *, color=(0, 0, 255), radiu
                               colors=colors.astype(np.uint8),
                               radii=np.full(xyz.shape[0], radius, np.float32)))
 
+# ------------------------------------------------------------------------------
+# Device helper for tensors
+# ------------------------------------------------------------------------------
+def _to_dev(x):
+    """Move tensor to the global `device` if needed (NOP for non‑tensors)."""
+    return x.to(device) if torch.is_tensor(x) and x.device != device else x
+
 # ────────────────────────────────────────────────────────────────────────────────
 #  Initialisation
 # ────────────────────────────────────────────────────────────────────────────────
@@ -195,6 +211,24 @@ async def initialise_models_and_params():
         "keyframe_adapt_max":         ka.get("adapt_max",              5),
         "keyframe_adapt_stride_step": ka.get("adapt_stride_step",      1),
     })
+
+    # ------------------------------------------------------------------
+    # Allow on‑the‑fly tuning of the SLAM confidence thresholds
+    # (helpful when the default values from wild.yaml are too strict
+    #  for a given camera or lighting condition).
+    # ------------------------------------------------------------------
+    slam_params["conf_thres_i2p"] = float(
+        os.getenv("SLAM3R_CONF_THRES_I2P", slam_params["conf_thres_i2p"])
+    )
+    slam_params["conf_thres_l2w"] = float(
+        os.getenv("SLAM3R_CONF_THRES_L2W", slam_params["conf_thres_l2w"])
+    )
+    logger.info(
+        "Runtime confidence thresholds: I2P=%.2f  |  L2W=%.2f",
+        slam_params["conf_thres_i2p"],
+        slam_params["conf_thres_l2w"],
+    )
+
     logger.info("SLAM params: %s", slam_params)
     is_slam_system_initialized = True
 
@@ -276,7 +310,27 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
     _, tok, pos = slam3r_get_img_tokens([{"img": view["img"].to(device),
                                           "true_shape": view["true_shape"].to(device)}], i2p_model)
     record["img_tokens"], record["img_pos"] = tok[0], pos[0]
-    
+
+    # ------------------------------------------------------------------
+    # Back‑fill any missing encoder tokens for existing keyframes
+    # (can happen if the record was created before we introduced token
+    #  caching, or after a hot‑restart).
+    # ------------------------------------------------------------------
+    for kf_idx in list(keyframe_indices):
+        if kf_idx >= len(processed_frames_history):
+            continue  # skip indices that haven’t been written yet
+        kf_hist = processed_frames_history[kf_idx]
+        if kf_hist.get("img_tokens") is None:
+            # Re‑encode this keyframe on‑the‑fly
+            batched_img  = kf_hist["img_tensor"].unsqueeze(0).to(device)
+            batched_true = kf_hist["true_shape"].unsqueeze(0).to(device)
+            _, tok_kf, pos_kf = slam3r_get_img_tokens(
+                [{"img": batched_img, "true_shape": batched_true}],
+                i2p_model,
+            )
+            kf_hist["img_tokens"] = tok_kf[0]
+            kf_hist["img_pos"]    = pos_kf[0]
+
     #  I2P local reconstruction
     ref_kf   = processed_frames_history[keyframe_indices[-1]]
 
@@ -286,20 +340,43 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
 
     # add the same for the current frame’s record
     record["img"] = record["img_tensor"].unsqueeze(0)
-    
-    mv_input = [[
+
+    window_pair = [
         {k: ref_kf[k] for k in ("img", "img_tokens", "img_pos", "true_shape")},
         {k: record[k] for k in ("img", "img_tokens", "img_pos", "true_shape")},
-    ]]
+    ]
+    # replicate the same <ref,src> pair to build a micro‑batch; cheap and keeps logic unchanged
+    mv_input = [window_pair] * INFERENCE_WINDOW_BATCH
     pred = i2p_inference_batch(mv_input, i2p_model, ref_id=0)["preds"][0]
     record["pts3d_cam"], record["conf_cam"] = pred["pts3d"], pred["conf"]
 
-    #  L2W global registration
-    cand_views = [{k: processed_frames_history[i][k]
-                   for k in ("img_tokens", "img_pos", "true_shape", "pts3d_world")}
-                  for i in keyframe_indices]
-    src_view = {**{k: record[k] for k in ("img_tokens", "img_pos", "true_shape")},
-                "pts3d_cam": record["pts3d_cam"]}
+    # ------------------------------------------------------------------
+    # Build device‑safe reference & source views
+    # ------------------------------------------------------------------
+    cand_views = []
+    for idx in keyframe_indices:
+        hist_v = processed_frames_history[idx]
+        if "pts3d_world" not in hist_v:
+            continue   # not registered yet
+        cand_views.append({
+            "img_tokens":  _to_dev(hist_v["img_tokens"]),
+            "img_pos":     _to_dev(hist_v["img_pos"]),
+            "true_shape":  _to_dev(hist_v["true_shape"]),
+            "pts3d_world": _to_dev(hist_v["pts3d_world"]),
+        })
+
+    # Bail out gracefully until we have at least one fully registered keyframe
+    if not cand_views:
+        processed_frames_history.append(record)
+        current_frame_index += 1
+        return None, None, None
+
+    src_view = {
+        "img_tokens": _to_dev(record["img_tokens"]),
+        "img_pos":    _to_dev(record["img_pos"]),
+        "true_shape": _to_dev(record["true_shape"]),
+        "pts3d_cam":  _to_dev(record["pts3d_cam"]),
+    }
     ref_views, _ = slam3r_scene_frame_retrieve(
         cand_views, [src_view], i2p_model,
         sel_num=min(slam_params["num_scene_frame"], len(cand_views)))
@@ -311,22 +388,56 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
     #  Pose via SVD
     P_cam   = record["pts3d_cam"].squeeze(0).cpu().reshape(-1, 3).numpy()
     P_world = record["pts3d_world"].squeeze(0).cpu().reshape(-1, 3).numpy()
-    mask = ((record["conf_cam"].squeeze().cpu().numpy()  > slam_params["conf_thres_i2p"])
-          & (record["conf_world"].squeeze().cpu().numpy() > slam_params["conf_thres_l2w"]))
-    R, t = estimate_rigid_transform_svd(P_cam[mask], P_world[mask])
+
+    # Flatten confidence maps so boolean indexing matches the (N,3) flattened point arrays
+    conf_cam_flat   = record["conf_cam"].squeeze().cpu().numpy().reshape(-1)
+    conf_world_flat = record["conf_world"].squeeze().cpu().numpy().reshape(-1)
+    mask = ((conf_cam_flat   > slam_params["conf_thres_i2p"]) &
+            (conf_world_flat > slam_params["conf_thres_l2w"]))
+
+    # --- diagnostics & graceful fallback ---------------------------------
+    n_corr = int(mask.sum())
+    if n_corr < 3:
+        logger.debug(
+            "Too few correspondences for SVD (%d) – "
+            "relaxing L2W conf‑threshold for this frame.", n_corr
+        )
+        relaxed_mask = (
+            (conf_cam_flat > slam_params["conf_thres_i2p"])
+            & (conf_world_flat > 0.5 * slam_params["conf_thres_l2w"])
+        )
+        mask = relaxed_mask
+        n_corr = int(mask.sum())
+        logger.debug("Correspondences after relaxation: %d", n_corr)
+    # ---------------------------------------------------------------------
+
+    if mask.sum() >= 3:
+        R, t = estimate_rigid_transform_svd(P_cam[mask], P_world[mask])
+    else:
+        R, t = np.eye(3), np.zeros((3, 1))
     T = np.eye(4); T[:3, :3], T[:3, 3] = R, t.squeeze()
     record["raw_pose_matrix"] = T.tolist()
 
     #  Add confident points to global buffer
-    mask_world = record["conf_world"].squeeze().cpu().numpy() > slam_params["conf_thres_l2w"]
-    new_pts = P_world[mask_world]
+    # flatten confidence so mask length matches flattened point array
+    conf_world_flat = record["conf_world"].squeeze().cpu().numpy().reshape(-1)
+    mask_world = conf_world_flat > slam_params["conf_thres_l2w"]
+    if mask_world.sum() < 3:  # fall back to the relaxed mask used for pose
+        mask_world = conf_world_flat > 0.5 * slam_params["conf_thres_l2w"]
+    new_pts         = P_world[mask_world]
     world_point_cloud_buffer.extend(new_pts.tolist())
     temp_world_pts.extend(new_pts.tolist())
+
+    # ------------------------------------------------------------
+    # Commit the frame record to history *before* we index it
+    # ------------------------------------------------------------
+    record_index = len(processed_frames_history)
+    processed_frames_history.append(record)
 
     #  Keyframe selection (simple stride)
     if current_frame_index % (active_kf_stride or 1) == 0:
         record["keyframe_id"] = f"kf_{len(keyframe_indices)}"
-        keyframe_indices.append(current_frame_index)
+        keyframe_indices.append(record_index)
         keyframe_id_out = record["keyframe_id"]
 
     #  Rerun logging
@@ -341,11 +452,12 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
             rr.log("log/info", rr.TextLog(text=f"KF {keyframe_id_out} added", color=[0, 255, 0]))
 
     #  Pack for RabbitMQ
+    q = matrix_to_quaternion(T[:3, :3])
     pose_msg = {
         "timestamp_ns": ts_ns,
         "processing_timestamp": str(datetime.now().timestamp()),
         "position": dict(zip("xyz", T[:3, 3].astype(float))),
-        "orientation": dict(zip("xyz", matrix_to_quaternion(T[:3, :3])) | {"w": float(matrix_to_quaternion(T[:3, :3])[3])}),
+        "orientation": {"x": float(q[0]), "y": float(q[1]), "z": float(q[2]), "w": float(q[3])},
         "raw_pose_matrix": record["raw_pose_matrix"],
     }
     if len(temp_world_pts) > 50_000:
@@ -354,7 +466,6 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
     vis_msg = {"timestamp_ns": ts_ns, "type": "points_update_incremental",
                "vertices": temp_world_pts[:50_000], "faces": [], "keyframe_id": keyframe_id_out}
 
-    processed_frames_history.append(record)
     current_frame_index += 1
     logger.info("Frame %d processed in %.2fs", current_frame_index - 1, time.time() - start)
     return pose_msg, pc_msg, vis_msg
