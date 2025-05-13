@@ -70,6 +70,7 @@
 #   preprocessing is mainly used here).
 
 import asyncio
+import gzip
 import os
 import json
 import logging
@@ -82,6 +83,7 @@ import yaml
 import shutil
 import requests
 from pathlib import Path
+import random
 import time
 from torchvision import transforms # Added for potential future use with SLAM3R utils
 
@@ -644,9 +646,6 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
         preprocessed_image_tensor = preprocessed_image_tensor.to(device)
 
         if rerun_connected:
-            # Log RGB image (convert BGR to RGB)
-            rgb_image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
-            rr.log("world/camera/image", rr.Image(rgb_image_np))
 
             # Log Camera Intrinsics if available
             if current_frame_intrinsics:
@@ -850,13 +849,14 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
                         # Store initial keyframes and their world points
                         # The initial_pcds are already in a common (world) frame relative to init_ref_id
                         init_kf_counter = 0
+
                         for i in range(len(slam_initialization_buffer)):
                             history_idx = current_frame_index - len(slam_initialization_buffer) + i + 1
 
                             # Check if history_idx is within range
                             if history_idx >= len(processed_frames_history):
-                                logger.warning(f"History index {history_idx} out of range for processed_frames_history (length {len(processed_frames_history)})")
                                 # Append empty frame data to processed_frames_history if needed
+                                logger.warning(f"History index {history_idx} out of range for processed_frames_history (length {len(processed_frames_history)})")
                                 while len(processed_frames_history) <= history_idx:
                                     processed_frames_history.append({
                                         'img_tensor': None,
@@ -979,19 +979,13 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
             # i2p_output['preds'] is a list (outer batch) of lists (inner window) of dicts
             # Each dict has 'pts3d', 'conf'
             # Since we're using a reference view (0) and current view (1), we need the result for the current view
-            try:
-                # The structure is different now - we need to get the current view results, which is index 1
-                # [0] is the first batch, [1] is the current frame (second view)
-                current_pts3d_cam = i2p_output['preds'][1]['pts3d']  # Shape: (1, H, W, 3) or (1, N, 3)
-                current_conf_cam = i2p_output['preds']['conf']    # Shape: (1, H, W) or (1, N)
-                frame_data_for_history['pts3d_cam'] = current_pts3d_cam
-                frame_data_for_history['conf_cam'] = current_conf_cam
-                logger.info(f"Successfully processed I2P for frame {current_frame_index} with shape {current_pts3d_cam.shape}")
-            except (IndexError, KeyError) as e:
-                logger.error(f"Error accessing I2P output: {e}. Output structure: {list(i2p_output.keys())} with preds length: {len(i2p_output.get('preds', []))}")
-                frame_data_for_history['pts3d_cam'] = None
-                frame_data_for_history['conf_cam'] = None
-                return None, None, None
+            view_idx = 0                       # 0 = current frame, 1 = ref keyframe
+            current_pred   = i2p_output["preds"][view_idx]   # ← safest, matches recon.py
+            current_pts3d_cam = current_pred["pts3d"]
+            current_conf_cam  = current_pred["conf"]
+            frame_data_for_history['pts3d_cam'] = current_pts3d_cam
+            frame_data_for_history['conf_cam'] = current_conf_cam
+            logger.info(f"Successfully processed I2P for frame {current_frame_index} with shape {current_pts3d_cam.shape}")
 
 
             # 2. L2W: Register local points (current_pts3d_cam) to world frame
@@ -1134,10 +1128,11 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
                 # The 'valid_mask_l2w' was computed above as 'world_conf_tensor > conf_l2w'
                 # This filtering is for the point cloud, separate from pose estimation points.
                 valid_mask_for_pc = world_conf_tensor > slam_params.get('conf_thres_l2w', 12.0)
-                points_to_add_world = P_world_np[valid_mask_for_pc] # Use P_world_np directly
+                valid_mask_flat = valid_mask_for_pc.reshape(-1)
+                points_to_add_world = P_world_np[valid_mask_flat] # Use P_world_np directly
                 
                 world_point_cloud_buffer.extend(points_to_add_world.tolist())
-                temp_points_xyz_list = points_to_add_world.tolist() # For current frame output
+                temp_points_xyz_list = points_to_add_world.tolist() # For current frame output, use valid points only
 
                 # Keyframe decision logic (simplified)
                 # Based on stride, or confidence, or if L2W was successful
@@ -1221,21 +1216,30 @@ async def process_image_with_slam3r(image_np, timestamp_ns, headers):
             "raw_pose_matrix": current_pose_matrix_list
         }
         
+        MAX_POINTS_PER_MESSAGE = 50_000      # tune to stay < frame_max
+        if len(temp_points_xyz_list) > MAX_POINTS_PER_MESSAGE:
+            # simple reservoir sample; keeps early + late points
+            step = max(1, len(temp_points_xyz_list) // MAX_POINTS_PER_MESSAGE)
+            sampled_pts = temp_points_xyz_list[::step]
+        else:
+            sampled_pts = temp_points_xyz_list
+
         point_cloud_data = {
             "timestamp_ns": timestamp_ns,
             "processing_timestamp": str(datetime.now().timestamp()),
-            "points": temp_points_xyz_list # Points from current frame's L2W output (world coords) or init
+            "points": sampled_pts
         }
+
+        MAX_VIS_POINTS = 50_000
+        if len(temp_points_xyz_list) > MAX_VIS_POINTS:
+            temp_points_xyz_list = random.sample(temp_points_xyz_list, MAX_VIS_POINTS)
         
-        # For reconstruction_update_data, send current frame's world points as an incremental update
-        # No faces, as SLAM3R here is point-based for this flow.
         reconstruction_update_data = {
             "timestamp_ns": timestamp_ns,
-            "processing_timestamp": str(datetime.now().timestamp()),
-            "type": "points_update_incremental", # Changed from mesh to points
-            "vertices": temp_points_xyz_list, # Use current frame's world points
-            "faces": [], # No faces
-            "keyframe_id": keyframe_id_for_output 
+            "type": "points_update_incremental",
+            "vertices": temp_points_xyz_list,
+            "faces": [],
+            "keyframe_id": keyframe_id_for_output,
         }
         
         # Optional: Prune processed_frames_history if it gets too large and items are not needed
@@ -1292,16 +1296,16 @@ async def on_video_frame_message(message: aio_pika.IncomingMessage, exchanges):
 
             if point_cloud and SLAM3R_POINTCLOUD_EXCHANGE_OUT in exchanges:
                 pc_message = aio_pika.Message(
-                    body=json.dumps(point_cloud).encode(), # Consider more efficient serialization for large point clouds
-                    content_type="application/json",
+                    body=gzip.compress(json.dumps(point_cloud).encode()), # Compress point cloud data
+                    content_type="application/json+gzip", # Update content type to indicate compression
                     headers={"source_timestamp_ns": str(timestamp_ns)}
                 )
                 await exchanges[SLAM3R_POINTCLOUD_EXCHANGE_OUT].publish(pc_message, routing_key="")
             
             if recon_update and SLAM3R_RECONSTRUCTION_VIS_EXCHANGE_OUT in exchanges:
                 recon_message = aio_pika.Message(
-                    body=json.dumps(recon_update).encode(),
-                    content_type="application/json",
+                    body=gzip.compress(json.dumps(recon_update).encode()),
+                    content_type="application/json+gzip",
                     headers={"source_timestamp_ns": str(timestamp_ns)}
                 )
                 await exchanges[SLAM3R_RECONSTRUCTION_VIS_EXCHANGE_OUT].publish(recon_message, routing_key="")
