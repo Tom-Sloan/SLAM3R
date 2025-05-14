@@ -61,7 +61,7 @@ CAMERA_INTRINSICS_FILE_PATH        = os.getenv("CAMERA_INTRINSICS_FILE", "/app/S
 DEFAULT_MODEL_INPUT_RESOLUTION = 224
 # How many <ref,src> windows to batch together for the I2P forward pass
 # (set > 1 to enable lightweight batching without touching the outer loop).
-INFERENCE_WINDOW_BATCH = int(os.getenv("SLAM3R_INFERENCE_BATCH", "1"))
+INFERENCE_WINDOW_BATCH = int(os.getenv("SLAM3R_INFERENCE_BATCH", "10"))
 
 TARGET_IMAGE_WIDTH  = int(os.getenv("TARGET_IMAGE_WIDTH",
                                     str(DEFAULT_MODEL_INPUT_RESOLUTION)))
@@ -241,6 +241,18 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
 
     start = time.time()
     tensor, _ = preprocess_image(img_bgr, TARGET_IMAGE_WIDTH, TARGET_IMAGE_HEIGHT)
+
+    # ------------------------------------------------------------------
+    # Rerun: stream the current RGB frame so it shows up under the
+    # "2D › camera_lowres › rgb" track, matching the ARKitScenes example.
+    # ------------------------------------------------------------------
+    if rerun_connected:
+        img_rgb_u8 = (tensor          # CHW, float32 [0,1]
+                      .permute(1, 2, 0)         # → HWC
+                      .cpu()
+                      .numpy() * 255.0)         # back to [0,255]
+        img_rgb_u8 = img_rgb_u8.astype(np.uint8)
+        rr.log("camera_lowres/rgb", rr.Image(img_rgb_u8))
 
     # ------------------------------ View dict & history slot
     view = {
@@ -448,6 +460,9 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
         if temp_world_pts:
             log_points_to_rerun(f"world/incremental/frame_{current_frame_index}",
                                 np.asarray(temp_world_pts, np.float32))
+            # Easier 3 D browsing – aggregate the points under /world/points
+            if temp_world_pts:
+                log_points_to_rerun("world/points", np.asarray(temp_world_pts, np.float32))
         if keyframe_id_out:
             rr.log("log/info", rr.TextLog(text=f"KF {keyframe_id_out} added", color=[0, 255, 0]))
 
