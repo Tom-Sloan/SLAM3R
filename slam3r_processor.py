@@ -95,6 +95,30 @@ active_kf_stride                   = 1
 
 rerun_connected = False  # viewer link flag
 
+
+# ───────────────────────────────────────────────────────────────────────────────
+#  Camera intrinsics (helper + one‑time load)
+# ───────────────────────────────────────────────────────────────────────────────
+def load_yaml_intrinsics(path: str):
+    """
+    Return a dict with keys fx, fy, cx, cy read from a YAML file.
+    Returns None if the file is missing or malformed.
+    """
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        data = yaml.safe_load(p.read_text())
+        return {k: float(data[k]) for k in ("fx", "fy", "cx", "cy")}
+    except Exception as e:
+        logger.warning("Failed to parse camera intrinsics YAML: %s", e)
+        return None
+
+camera_intrinsics = load_yaml_intrinsics(CAMERA_INTRINSICS_FILE_PATH) or {}
+if not camera_intrinsics:
+    logger.warning("No camera intrinsics found – skipping frustum logging.")
+
+#
 # ────────────────────────────────────────────────────────────────────────────────
 #  Utility helpers
 # ────────────────────────────────────────────────────────────────────────────────
@@ -115,7 +139,14 @@ def matrix_to_quaternion(m: np.ndarray) -> np.ndarray:
     return q
 
 def cv_to_rerun_xyz(xyz: np.ndarray) -> np.ndarray:
-    xyz_rerun = xyz.copy(); xyz_rerun[:, 1] *= -1.0; return xyz_rerun
+    """
+    Convert from OpenCV (x→right, y→down, z→forward)
+    to Rerun RIGHT_HAND_Y_UP (x→right, y→up, z→forward).
+    """
+    xyz_rerun = xyz.copy()
+    xyz_rerun[:, 1] *= -1.0     # flip vertical
+    xyz_rerun[:, 0] *= -1.0     # NEW – flip left/right
+    return xyz_rerun
 
 def estimate_rigid_transform_svd(P: np.ndarray, Q: np.ndarray):
     if len(P) < 3: return np.eye(3), np.zeros((3, 1))
@@ -213,8 +244,9 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
     start = time.time()
     tensor, _ = preprocess_image(img_bgr, TARGET_IMAGE_WIDTH, TARGET_IMAGE_HEIGHT)
 
+    img_rgb_u8 = (tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
     if rerun_connected:
-        rr.log("camera_lowres/rgb", rr.Image((tensor.permute(1, 2, 0).cpu().numpy()*255).astype(np.uint8)))
+        rr.log("camera_lowres/rgb", rr.Image(img_rgb_u8))
 
     view = {
         "img": tensor.unsqueeze(0),
@@ -378,6 +410,25 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
             log_points_to_rerun("world/points", temp_world_pts)
         if keyframe_id_out:
             rr.log("log/info", rr.TextLog(text=f"KF {keyframe_id_out} added", color=[0,255,0]))
+
+        if camera_intrinsics:
+            frustum_path = f"world/camera_frustums/frame_{current_frame_index}"
+            rr.log(
+                frustum_path,
+                rr.Transform3D(
+                    translation=T[:3, 3],
+                    rotation=rr.Quaternion(xyzw=matrix_to_quaternion(T[:3, :3])),
+                ),
+            )
+            rr.log(
+                frustum_path + "/pinhole",
+                rr.Pinhole(
+                    focal_length_px=[camera_intrinsics['fx'], camera_intrinsics['fy']],
+                    principal_point_px=[camera_intrinsics['cx'], camera_intrinsics['cy']],
+                    image_size_px=[TARGET_IMAGE_WIDTH, TARGET_IMAGE_HEIGHT],
+                ),
+            )
+            rr.log(frustum_path + "/image", rr.Image(img_rgb_u8))    
 
     # ---------- RabbitMQ payloads ----------
     sampled_pairs = random.sample(temp_world_pts, 50_000) if len(temp_world_pts) > 50_000 else temp_world_pts
