@@ -1,8 +1,7 @@
 # slam3r/slam3r_processor.py
-# Lightweight entry‑point for the SLAM3R Docker service.
 # – Consumes RGB frames from RabbitMQ
-# – Runs the SLAM3R incremental pipeline (I2P → L2W → pose SVD → KF logic)
-# – Publishes pose / point‑cloud / recon‑viz messages (and optional Rerun stream)
+# – Runs the SLAM3R incremental pipeline (I2P → L2W → pose SVD → KF logic)
+# – Publishes pose / point-cloud / recon-viz messages (and optional Rerun stream)
 
 import asyncio, gzip, json, logging, os, random, time
 from datetime import datetime
@@ -57,11 +56,8 @@ SLAM3R_CONFIG_FILE_PATH_IN_CONTAINER= os.getenv("SLAM3R_CONFIG_FILE", "/app/SLAM
 CAMERA_INTRINSICS_FILE_PATH        = os.getenv("CAMERA_INTRINSICS_FILE", "/app/SLAM3R_engine/configs/camera_intrinsics.yaml")
 
 
-# Models were trained on 224 × 224 crops ─ keep that as the canonical default.
+# Models were trained on 224 × 224 crops ─ keep that as the canonical default.
 DEFAULT_MODEL_INPUT_RESOLUTION = 224
-# How many <ref,src> windows to batch together for the I2P forward pass.
-# NOTE: The downstream L2W decoder assumes a batch size of 1.  Using a larger
-# value causes a view×batch mis‑alignment (“shape … is invalid for input …”).
 _req_batch = int(os.getenv("SLAM3R_INFERENCE_BATCH", "1"))
 if _req_batch > 1:
     logger.warning(
@@ -80,7 +76,7 @@ INIT_QUALITY_MIN_CONF   = float(os.getenv("INITIALIZATION_QUALITY_MIN_AVG_CONFID
 INIT_QUALITY_MIN_POINTS = int  (os.getenv("INITIALIZATION_QUALITY_MIN_TOTAL_VALID_POINTS", "100"))
 
 # ────────────────────────────────────────────────────────────────────────────────
-#  Global run‑time state
+#  Global run-time state
 # ────────────────────────────────────────────────────────────────────────────────
 device                          = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 i2p_model                       = l2w_model = None
@@ -89,8 +85,8 @@ is_slam_system_initialized      = False
 
 processed_frames_history : list = []
 keyframe_indices          : list = []
-world_point_cloud_buffer  : list = []
-camera_positions : list = []       # running trail of camera centres
+world_point_cloud_buffer  : list = []   # (xyz,rgb) tuples
+camera_positions : list = []            # running trail of camera centres
 
 current_frame_index                = 0
 slam_initialization_buffer   : list = []
@@ -103,92 +99,59 @@ rerun_connected = False  # viewer link flag
 #  Utility helpers
 # ────────────────────────────────────────────────────────────────────────────────
 def matrix_to_quaternion(m: np.ndarray) -> np.ndarray:
-    """Convert 3×3 rot‑matrix to (x,y,z,w) quaternion."""
-    q = np.empty(4)
-    t = np.trace(m)
+    q = np.empty(4); t = np.trace(m)
     if t > 0:
-        t = np.sqrt(t + 1)
-        q[3] = 0.5 * t
-        t = 0.5 / t
+        t = np.sqrt(t + 1); q[3] = 0.5 * t; t = 0.5 / t
         q[0] = (m[2, 1] - m[1, 2]) * t
         q[1] = (m[0, 2] - m[2, 0]) * t
         q[2] = (m[1, 0] - m[0, 1]) * t
     else:
-        i = np.argmax(np.diag(m))
-        j, k = (i + 1) % 3, (i + 2) % 3
+        i = np.argmax(np.diag(m)); j, k = (i + 1) % 3, (i + 2) % 3
         t = np.sqrt(m[i, i] - m[j, j] - m[k, k] + 1)
-        q[i] = 0.5 * t
-        t = 0.5 / t
+        q[i] = 0.5 * t; t = 0.5 / t
         q[3] = (m[k, j] - m[j, k]) * t
         q[j] = (m[j, i] + m[i, j]) * t
         q[k] = (m[k, i] + m[i, k]) * t
     return q
 
-# ------------------------------------------------------------------
-# Coordinate‑system helpers
-# ------------------------------------------------------------------
 def cv_to_rerun_xyz(xyz: np.ndarray) -> np.ndarray:
-    """
-    Convert point coordinates from the OpenCV camera convention
-    (x → right, y → down, z → forward) to the Rerun
-    RIGHT_HAND_Y_UP convention (x → right, y → up, z → forward).
-    """
-    xyz_rerun = xyz.copy()
-    xyz_rerun[:, 1] *= -1.0           # flip vertical axis
-    return xyz_rerun
+    xyz_rerun = xyz.copy(); xyz_rerun[:, 1] *= -1.0; return xyz_rerun
 
 def estimate_rigid_transform_svd(P: np.ndarray, Q: np.ndarray):
-    """SVD‑based Umeyama alignment."""
-    if len(P) < 3:
-        return np.eye(3), np.zeros((3, 1))
+    if len(P) < 3: return np.eye(3), np.zeros((3, 1))
     Pc, Qc = P - P.mean(0), Q - Q.mean(0)
     U, _, Vt = np.linalg.svd(Pc.T @ Qc)
     R = Vt.T @ U.T
-    if np.linalg.det(R) < 0:
-        Vt[2] *= -1
-        R = Vt.T @ U.T
+    if np.linalg.det(R) < 0: Vt[2] *= -1; R = Vt.T @ U.T
     t = Q.mean(0, keepdims=True).T - R @ P.mean(0, keepdims=True).T
     return R, t
 
-def load_yaml_intrinsics(path: str):
-    if not Path(path).exists():
-        return None
-    d = yaml.safe_load(Path(path).read_text())
-    return {k: float(d[k]) for k in ('fx', 'fy', 'cx', 'cy')}
-
-def preprocess_image(img_bgr: np.ndarray, target_w: int, target_h: int, intrinsics=None):
-    h, w, _ = img_bgr.shape
-    img_rgb = cv2.cvtColor(cv2.resize(img_bgr, (target_w, target_h)), cv2.COLOR_BGR2RGB)
+def preprocess_image(img_bgr: np.ndarray, w: int, h: int):
+    img_rgb = cv2.cvtColor(cv2.resize(img_bgr, (w, h)), cv2.COLOR_BGR2RGB)
     tensor  = torch.tensor(img_rgb, dtype=torch.float32).permute(2, 0, 1) / 255.0
-    if intrinsics:
-        sx, sy = target_w / w, target_h / h
-        intrinsics = {k: v * (sx if k in ("fx", "cx") else sy) for k, v in intrinsics.items()}
-    return tensor.to(device), intrinsics
+    return tensor.to(device), None
 
-def log_points_to_rerun(label: str, xyz: np.ndarray, *, rgb: np.ndarray | None = None, radius: float = 0.007, fallback_color=(0, 0, 255)):
-    if not rerun_connected or xyz is None or xyz.size == 0:
+# ────────────────────────────  new helpers  ────────────────────────────
+def colors_from_image(tensor_chw: torch.Tensor) -> np.ndarray:
+    img = (tensor_chw.permute(1, 2, 0).cpu().numpy() * 255.0)
+    return img.astype(np.uint8).reshape(-1, 3)
+
+def log_points_to_rerun(label: str,
+                        pts_col_pairs: list[tuple[np.ndarray, np.ndarray]],
+                        *,
+                        radius: float = 0.007):
+    if not rerun_connected or not pts_col_pairs:
         return
-    xyz = cv_to_rerun_xyz(xyz)
-    if rgb is None:
-        colors = np.tile(fallback_color, (xyz.shape[0], 1)).astype(np.uint8)
-    else:
-        if len(rgb) != len(xyz):
-            raise ValueError("rgb array length must match xyz length")
-        colors = rgb.astype(np.uint8)
-    rr.log(
-        label,
-        rr.Points3D(
-            positions=xyz.astype(np.float32),
-            colors=colors,
-            radii=np.full(xyz.shape[0], radius, np.float32),
-        ),
-    )
+    xyz, rgb = map(np.asarray, zip(*pts_col_pairs))
+    rr.log(label,
+           rr.Points3D(
+               positions=cv_to_rerun_xyz(xyz.astype(np.float32)),
+               colors=rgb.astype(np.uint8),
+               radii=np.full(len(xyz), radius, np.float32),
+           ))
 
 # ------------------------------------------------------------------------------
-# Device helper for tensors
-# ------------------------------------------------------------------------------
-def _to_dev(x):
-    """Move tensor to the global `device` if needed (NOP for non‑tensors)."""
+def _to_dev(x):  # tensor device helper
     return x.to(device) if torch.is_tensor(x) and x.device != device else x
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -196,46 +159,25 @@ def _to_dev(x):
 # ────────────────────────────────────────────────────────────────────────────────
 async def initialise_models_and_params():
     global i2p_model, l2w_model, slam_params, is_slam_system_initialized, rerun_connected
-
     if is_slam_system_initialized or not SLAM3R_ENGINE_AVAILABLE:
         return
 
-    # Rerun handshake (run once)
     if os.getenv("RERUN_ENABLED", "true") == "true" and not rerun_connected:
         rr.init("SLAM3R_Processor", spawn=False)
-        # ------------------------------------------------------------------
-        # Robust Rerun connection: try a short list of candidates, but
-        # *verify the pipe drains* (flush test) before assuming success.
-        # ------------------------------------------------------------------
-        host_candidates = [
+        for host in filter(None, [
             os.getenv("RERUN_CONNECT_URL"),
             "rerun+http://host.docker.internal:9876/proxy",
             "rerun+http://127.0.0.1:9876/proxy",
-        ]
-        for host in host_candidates:
-            if not host:
-                continue
+        ]):
             try:
                 rr.connect_grpc(host, flush_timeout_sec=15)
-                # quick sanity ping – if this hangs we treat it as a failure
-                rr.log(
-                    "healthcheck",
-                    rr.TextLog(text="SLAM3R handshake ✔"),
-                )
+                rr.log("healthcheck", rr.TextLog(text="SLAM3R handshake ✔"))
                 rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_UP, static=True)
-                rerun_connected = True
-                logger.info("Connected to Rerun at %s", host)
-                break
+                rerun_connected = True; logger.info("Connected to Rerun at %s", host); break
             except Exception as e:
-                logger.warning("Failed to connect/flush to Rerun at %s: %s", host, e)
-                try:
-                    rr.disconnect()
-                except Exception:
-                    pass
+                logger.warning("Failed to connect Rerun at %s: %s", host, e)
         if not rerun_connected:
-            logger.warning(
-                "All Rerun connection attempts failed – continuing without live viz."
-            )
+            logger.warning("All Rerun connection attempts failed – running headless.")
 
     logger.info("Loading SLAM3R models (device=%s)…", device)
     i2p_model = Image2PointsModel.from_pretrained("siyan824/slam3r_i2p").to(device).eval()
@@ -243,46 +185,26 @@ async def initialise_models_and_params():
 
     cfg = yaml.safe_load(Path(SLAM3R_CONFIG_FILE_PATH_IN_CONTAINER).read_text()) \
           if Path(SLAM3R_CONFIG_FILE_PATH_IN_CONTAINER).exists() else {}
-    rp = cfg.get("recon_pipeline", {})
-    ka = cfg.get("keyframe_adaptation", {})
+    rp, ka = cfg.get("recon_pipeline", {}), cfg.get("keyframe_adaptation", {})
     slam_params.update({
         "keyframe_stride":            rp.get("keyframe_stride",        -1),
         "initial_winsize":            rp.get("initial_winsize",        5),
         "win_r":                      rp.get("win_r",                  3),
-        "conf_thres_i2p":             rp.get("conf_thres_i2p",         1.5),
+        "conf_thres_i2p":             float(os.getenv("SLAM3R_CONF_THRES_I2P",  rp.get("conf_thres_i2p", 1.5))),
+        "conf_thres_l2w":             float(os.getenv("SLAM3R_CONF_THRES_L2W",  rp.get("conf_thres_l2w", 12.0))),
         "num_scene_frame":            rp.get("num_scene_frame",        10),
-        "conf_thres_l2w":             rp.get("conf_thres_l2w",         12.0),
-        "update_buffer_intv_factor":  rp.get("update_buffer_intv_factor", 1),
+        "norm_input_l2w":             rp.get("norm_input_l2w",         False),
         "buffer_size":                rp.get("buffer_size",            100),
         "buffer_strategy":            rp.get("buffer_strategy",        "reservoir"),
-        "norm_input_l2w":             rp.get("norm_input_l2w",         False),
         "keyframe_adapt_min":         ka.get("adapt_min",              1),
         "keyframe_adapt_max":         ka.get("adapt_max",              5),
         "keyframe_adapt_stride_step": ka.get("adapt_stride_step",      1),
     })
-
-    # ------------------------------------------------------------------
-    # Allow on‑the‑fly tuning of the SLAM confidence thresholds
-    # (helpful when the default values from wild.yaml are too strict
-    #  for a given camera or lighting condition).
-    # ------------------------------------------------------------------
-    slam_params["conf_thres_i2p"] = float(
-        os.getenv("SLAM3R_CONF_THRES_I2P", slam_params["conf_thres_i2p"])
-    )
-    slam_params["conf_thres_l2w"] = float(
-        os.getenv("SLAM3R_CONF_THRES_L2W", slam_params["conf_thres_l2w"])
-    )
-    logger.info(
-        "Runtime confidence thresholds: I2P=%.2f  |  L2W=%.2f",
-        slam_params["conf_thres_i2p"],
-        slam_params["conf_thres_l2w"],
-    )
-
     logger.info("SLAM params: %s", slam_params)
     is_slam_system_initialized = True
 
 # ────────────────────────────────────────────────────────────────────────────────
-#  Per‑frame processing
+#  Per-frame processing
 # ────────────────────────────────────────────────────────────────────────────────
 async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
     global current_frame_index, is_slam_initialized_for_session
@@ -291,19 +213,9 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
     start = time.time()
     tensor, _ = preprocess_image(img_bgr, TARGET_IMAGE_WIDTH, TARGET_IMAGE_HEIGHT)
 
-    # ------------------------------------------------------------------
-    # Rerun: stream the current RGB frame so it shows up under the
-    # "2D › camera_lowres › rgb" track, matching the ARKitScenes example.
-    # ------------------------------------------------------------------
     if rerun_connected:
-        img_rgb_u8 = (tensor          # CHW, float32 [0,1]
-                      .permute(1, 2, 0)         # → HWC
-                      .cpu()
-                      .numpy() * 255.0)         # back to [0,255]
-        img_rgb_u8 = img_rgb_u8.astype(np.uint8)
-        rr.log("camera_lowres/rgb", rr.Image(img_rgb_u8))
+        rr.log("camera_lowres/rgb", rr.Image((tensor.permute(1, 2, 0).cpu().numpy()*255).astype(np.uint8)))
 
-    # ------------------------------ View dict & history slot
     view = {
         "img": tensor.unsqueeze(0),
         "true_shape": torch.tensor([[TARGET_IMAGE_HEIGHT, TARGET_IMAGE_WIDTH]], device=device),
@@ -316,19 +228,16 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
         "raw_pose_matrix": np.eye(4).tolist(),
     }
 
-    temp_world_pts = []
-    temp_world_cols = []
+    temp_world_pts: list[tuple[np.ndarray, np.ndarray]] = []
     keyframe_id_out = None
 
-    # ─────────────────────────────────────────────────────────────────── bootstrap
+    # ──────────────────────────── bootstrap ────────────────────────────
     if not is_slam_initialized_for_session:
         slam_initialization_buffer.append(view)
         if len(slam_initialization_buffer) < slam_params["initial_winsize"]:
-            processed_frames_history.append(record)
-            current_frame_index += 1
+            processed_frames_history.append(record); current_frame_index += 1
             return None, None, None
 
-        # tokenise & init scene
         init_views = []
         for v in slam_initialization_buffer:
             _, tok, pos = slam3r_get_img_tokens([{
@@ -343,11 +252,9 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
         valid_counts = [(c > slam_params["conf_thres_i2p"]).sum().item() for c in confs]
         if sum(valid_counts) < INIT_QUALITY_MIN_POINTS:
             slam_initialization_buffer.clear()
-            processed_frames_history.append(record)
-            current_frame_index += 1
+            processed_frames_history.append(record); current_frame_index += 1
             return None, None, None
 
-        # commit bootstrap views as keyframes
         for idx, (pc, conf) in enumerate(zip(pcs, confs)):
             hist_idx = current_frame_index - len(slam_initialization_buffer) + idx
             processed_frames_history[hist_idx] |= {
@@ -358,98 +265,54 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
                 "keyframe_id": f"kf_{len(keyframe_indices)}",
             }
             keyframe_indices.append(hist_idx)
-            world_point_cloud_buffer.extend(pc.cpu().numpy()[conf.cpu().numpy() >
-                                                            slam_params["conf_thres_i2p"]])
+            pts_np = pc.cpu().numpy().reshape(-1, 3)
+            mask   = conf.cpu().numpy().reshape(-1) > slam_params["conf_thres_i2p"]
+            cols   = np.tile(np.array([[0,0,255]], np.uint8), (pts_np.shape[0],1))[mask]  # bootstrap → blue
+            world_point_cloud_buffer.extend(list(zip(pts_np[mask], cols)))
         slam_initialization_buffer.clear()
         is_slam_initialized_for_session = True
         logger.info("Bootstrap complete with %d keyframes.", len(keyframe_indices))
-        processed_frames_history.append(record)
-        current_frame_index += 1
-        return None, None, None        # nothing else to do this frame
+        processed_frames_history.append(record); current_frame_index += 1
+        return None, None, None
 
-    # ───────────────────────────────────────────────────────────── incremental
-    #  tokenise current frame
+    # ────────────────────────── incremental ────────────────────────────
     _, tok, pos = slam3r_get_img_tokens([{"img": view["img"].to(device),
                                           "true_shape": view["true_shape"].to(device)}], i2p_model)
     record["img_tokens"], record["img_pos"] = tok[0], pos[0]
 
-    # ------------------------------------------------------------------
-    # Back‑fill any missing encoder tokens for existing keyframes
-    # (can happen if the record was created before we introduced token
-    #  caching, or after a hot‑restart).
-    # ------------------------------------------------------------------
     for kf_idx in list(keyframe_indices):
-        if kf_idx >= len(processed_frames_history):
-            continue  # skip indices that haven’t been written yet
+        if kf_idx >= len(processed_frames_history): continue
         kf_hist = processed_frames_history[kf_idx]
         if kf_hist.get("img_tokens") is None:
-            # Re‑encode this keyframe on‑the‑fly
-            batched_img  = kf_hist["img_tensor"].unsqueeze(0).to(device)
-            batched_true = kf_hist["true_shape"].unsqueeze(0).to(device)
-            _, tok_kf, pos_kf = slam3r_get_img_tokens(
-                [{"img": batched_img, "true_shape": batched_true}],
-                i2p_model,
-            )
-            kf_hist["img_tokens"] = tok_kf[0]
-            kf_hist["img_pos"]    = pos_kf[0]
+            bi = kf_hist["img_tensor"].unsqueeze(0).to(device)
+            bt = kf_hist["true_shape"].unsqueeze(0).to(device)
+            _, tok_kf, pos_kf = slam3r_get_img_tokens([{"img": bi, "true_shape": bt}], i2p_model)
+            kf_hist["img_tokens"], kf_hist["img_pos"] = tok_kf[0], pos_kf[0]
 
-    #  I2P local reconstruction
-    ref_kf   = processed_frames_history[keyframe_indices[-1]]
-
-    # ensure the KF record keeps a batched img tensor
-    if "img" not in ref_kf or ref_kf["img"] is None:
-        ref_kf["img"] = ref_kf["img_tensor"].unsqueeze(0)        # [1,C,H,W]
-
-    # add the same for the current frame’s record
+    ref_kf = processed_frames_history[keyframe_indices[-1]]
+    if "img" not in ref_kf: ref_kf["img"] = ref_kf["img_tensor"].unsqueeze(0)
     record["img"] = record["img_tensor"].unsqueeze(0)
 
     window_pair = [
         {k: ref_kf[k] for k in ("img", "img_tokens", "img_pos", "true_shape")},
         {k: record[k] for k in ("img", "img_tokens", "img_pos", "true_shape")},
     ]
-    # replicate the same <ref,src> pair to build a micro‑batch; cheap and keeps logic unchanged
-    mv_input = [window_pair] * INFERENCE_WINDOW_BATCH
-    pred = i2p_inference_batch(mv_input, i2p_model, ref_id=0)["preds"][0]
+    pred = i2p_inference_batch([window_pair]*INFERENCE_WINDOW_BATCH, i2p_model, ref_id=0)["preds"][0]
     record["pts3d_cam"], record["conf_cam"] = pred["pts3d"], pred["conf"]
 
-    # --------------------------------------------------------------
-    # Accumulate high‑confidence world points so the viewer shows
-    # the full reconstruction instead of only the most recent slice.
-    # --------------------------------------------------------------
-    if "pts3d_world" in record:
-        if record.get("conf_cam") is not None:
-            conf_np = record["conf_cam"].cpu().numpy()
-            pts_np  = record["pts3d_world"].cpu().numpy()
-            mask = conf_np > slam_params["conf_thres_l2w"]
-            world_point_cloud_buffer.extend(pts_np[mask])
-        else:
-            world_point_cloud_buffer.extend(record["pts3d_world"].cpu().numpy().reshape(-1, 3))
+    # ---------------- colours -----------------
+    rgb_flat = colors_from_image(tensor)
 
-    # ------------------------------------------------------------------
-    # Build device‑safe reference & source views
-    # ------------------------------------------------------------------
+    # Build device-safe reference & source views
     cand_views = []
     for idx in keyframe_indices:
-        hist_v = processed_frames_history[idx]
-        if "pts3d_world" not in hist_v:
-            continue   # not registered yet
-        cand_views.append({
-            "img_tokens":  _to_dev(hist_v["img_tokens"]),
-            "img_pos":     _to_dev(hist_v["img_pos"]),
-            "true_shape":  _to_dev(hist_v["true_shape"]),
-            "pts3d_world": _to_dev(hist_v["pts3d_world"]),
-        })
+        hv = processed_frames_history[idx]
+        if "pts3d_world" not in hv: continue
+        cand_views.append({k: _to_dev(hv[k]) for k in
+                           ("img_tokens", "img_pos", "true_shape", "pts3d_world")})
 
-    # Bail out gracefully until we have at least one fully registered keyframe
     if not cand_views:
-        # --------------------------------------------------------------
-        # Live point‑cloud update to Rerun
-        # --------------------------------------------------------------
-        if world_point_cloud_buffer:
-            xyz_stack = np.vstack(world_point_cloud_buffer)
-            log_points_to_rerun("world/points", xyz_stack, radius=0.004)
-        processed_frames_history.append(record)
-        current_frame_index += 1
+        processed_frames_history.append(record); current_frame_index += 1
         return None, None, None
 
     src_view = {
@@ -466,92 +329,74 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
                             device=device, normalize=slam_params["norm_input_l2w"])[-1]
     record["pts3d_world"], record["conf_world"] = l2w_out["pts3d_in_other_view"], l2w_out["conf"]
 
-    #  Pose via SVD
+    # -------- pose SVD --------
     P_cam   = record["pts3d_cam"].squeeze(0).cpu().reshape(-1, 3).numpy()
     P_world = record["pts3d_world"].squeeze(0).cpu().reshape(-1, 3).numpy()
-
-    # Flatten confidence maps so boolean indexing matches the (N,3) flattened point arrays
     conf_cam_flat   = record["conf_cam"].squeeze().cpu().numpy().reshape(-1)
     conf_world_flat = record["conf_world"].squeeze().cpu().numpy().reshape(-1)
-    mask = ((conf_cam_flat   > slam_params["conf_thres_i2p"]) &
+    mask = ((conf_cam_flat > slam_params["conf_thres_i2p"]) &
             (conf_world_flat > slam_params["conf_thres_l2w"]))
-
-    # --- diagnostics & graceful fallback ---------------------------------
-    n_corr = int(mask.sum())
-    if n_corr < 3:
-        logger.debug(
-            "Too few correspondences for SVD (%d) – "
-            "relaxing L2W conf‑threshold for this frame.", n_corr
-        )
-        relaxed_mask = (
-            (conf_cam_flat > slam_params["conf_thres_i2p"])
-            & (conf_world_flat > 0.5 * slam_params["conf_thres_l2w"])
-        )
-        mask = relaxed_mask
-        n_corr = int(mask.sum())
-        logger.debug("Correspondences after relaxation: %d", n_corr)
-    # ---------------------------------------------------------------------
-
-    if mask.sum() >= 3:
-        R, t = estimate_rigid_transform_svd(P_cam[mask], P_world[mask])
-    else:
-        R, t = np.eye(3), np.zeros((3, 1))
-    T = np.eye(4); T[:3, :3], T[:3, 3] = R, t.squeeze()
+    if mask.sum() < 3:
+        mask = ((conf_cam_flat > slam_params["conf_thres_i2p"]) &
+                (conf_world_flat > 0.5 * slam_params["conf_thres_l2w"]))
+    R, t = estimate_rigid_transform_svd(P_cam[mask], P_world[mask]) if mask.sum() >=3 else (np.eye(3), np.zeros((3,1)))
+    T = np.eye(4); T[:3,:3], T[:3,3] = R, t.squeeze()
     record["raw_pose_matrix"] = T.tolist()
 
-    #  Add confident points to global buffer
-    # flatten confidence so mask length matches flattened point array
-    conf_world_flat = record["conf_world"].squeeze().cpu().numpy().reshape(-1)
+    # -------------- accumulate points --------------
     mask_world = conf_world_flat > slam_params["conf_thres_l2w"]
-    if mask_world.sum() < 3:  # fall back to the relaxed mask used for pose
+    if mask_world.sum() < 3:
         mask_world = conf_world_flat > 0.5 * slam_params["conf_thres_l2w"]
-    new_pts         = P_world[mask_world]
-    world_point_cloud_buffer.extend(new_pts.tolist())
-    temp_world_pts.extend(new_pts.tolist())
+    new_pts  = P_world[mask_world]
+    cols_flat = rgb_flat[mask_world]
+    pts_col_pairs = list(zip(new_pts.tolist(), cols_flat.tolist()))
+    world_point_cloud_buffer.extend(pts_col_pairs)
+    temp_world_pts.extend(pts_col_pairs)
 
-    # ------------------------------------------------------------
-    # Commit the frame record to history *before* we index it
-    # ------------------------------------------------------------
+    # ---------- push history ----------
     record_index = len(processed_frames_history)
     processed_frames_history.append(record)
 
-    #  Keyframe selection (simple stride)
+    # ---------- keyframe selection ----------
     if current_frame_index % (active_kf_stride or 1) == 0:
         record["keyframe_id"] = f"kf_{len(keyframe_indices)}"
         keyframe_indices.append(record_index)
         keyframe_id_out = record["keyframe_id"]
 
-    #  Rerun logging
+    # ---------- Rerun logging ----------
     if rerun_connected:
         rr.log("world/camera",
-               rr.Transform3D(translation=T[:3, 3],
-                              rotation=rr.Quaternion(xyzw=matrix_to_quaternion(T[:3, :3]))))
+               rr.Transform3D(translation=T[:3,3],
+                              rotation=rr.Quaternion(xyzw=matrix_to_quaternion(T[:3,:3]))))
+        camera_positions.append(T[:3,3].copy())
+        if len(camera_positions) > 1:
+            rr.log("world/camera_path",
+                   rr.LineStrips3D(np.stack(camera_positions, dtype=np.float32)[None]))
         if temp_world_pts:
             log_points_to_rerun(f"world/incremental/frame_{current_frame_index}",
-                                np.asarray(temp_world_pts, np.float32))
-            # Easier 3 D browsing – aggregate the points under /world/points
-            if temp_world_pts:
-                log_points_to_rerun("world/points", np.asarray(temp_world_pts, np.float32))
+                                temp_world_pts, radius=0.004)
+            log_points_to_rerun("world/points", temp_world_pts)
         if keyframe_id_out:
-            rr.log("log/info", rr.TextLog(text=f"KF {keyframe_id_out} added", color=[0, 255, 0]))
+            rr.log("log/info", rr.TextLog(text=f"KF {keyframe_id_out} added", color=[0,255,0]))
 
-    #  Pack for RabbitMQ
+    # ---------- RabbitMQ payloads ----------
+    sampled_pairs = random.sample(temp_world_pts, 50_000) if len(temp_world_pts) > 50_000 else temp_world_pts
+    xyz_only = [p for p,_ in sampled_pairs]
+
     q = matrix_to_quaternion(T[:3, :3])
     pose_msg = {
         "timestamp_ns": ts_ns,
         "processing_timestamp": str(datetime.now().timestamp()),
         "position": dict(zip("xyz", T[:3, 3].astype(float))),
-        "orientation": {"x": float(q[0]), "y": float(q[1]), "z": float(q[2]), "w": float(q[3])},
+        "orientation": {"x":float(q[0]), "y":float(q[1]), "z":float(q[2]), "w":float(q[3])},
         "raw_pose_matrix": record["raw_pose_matrix"],
     }
-    if len(temp_world_pts) > 50_000:
-        temp_world_pts = random.sample(temp_world_pts, 50_000)
-    pc_msg = {"timestamp_ns": ts_ns, "points": temp_world_pts}
+    pc_msg  = {"timestamp_ns": ts_ns, "points": xyz_only}
     vis_msg = {"timestamp_ns": ts_ns, "type": "points_update_incremental",
-               "vertices": temp_world_pts[:50_000], "faces": [], "keyframe_id": keyframe_id_out}
+               "vertices": xyz_only, "faces": [], "keyframe_id": keyframe_id_out}
 
     current_frame_index += 1
-    logger.info("Frame %d processed in %.2fs", current_frame_index - 1, time.time() - start)
+    logger.info("Frame %d processed in %.2fs", current_frame_index-1, time.time()-start)
     return pose_msg, pc_msg, vis_msg
 
 # ────────────────────────────────────────────────────────────────────────────────
