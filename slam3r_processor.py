@@ -59,9 +59,17 @@ CAMERA_INTRINSICS_FILE_PATH        = os.getenv("CAMERA_INTRINSICS_FILE", "/app/S
 
 # Models were trained on 224 × 224 crops ─ keep that as the canonical default.
 DEFAULT_MODEL_INPUT_RESOLUTION = 224
-# How many <ref,src> windows to batch together for the I2P forward pass
-# (set > 1 to enable lightweight batching without touching the outer loop).
-INFERENCE_WINDOW_BATCH = int(os.getenv("SLAM3R_INFERENCE_BATCH", "10"))
+# How many <ref,src> windows to batch together for the I2P forward pass.
+# NOTE: The downstream L2W decoder assumes a batch size of 1.  Using a larger
+# value causes a view×batch mis‑alignment (“shape … is invalid for input …”).
+_req_batch = int(os.getenv("SLAM3R_INFERENCE_BATCH", "1"))
+if _req_batch > 1:
+    logger.warning(
+        "SLAM3R_INFERENCE_BATCH=%d is not yet supported by the L2W path – "
+        "forcing it to 1 to avoid shape mismatches.",
+        _req_batch,
+    )
+INFERENCE_WINDOW_BATCH = 1
 
 TARGET_IMAGE_WIDTH  = int(os.getenv("TARGET_IMAGE_WIDTH",
                                     str(DEFAULT_MODEL_INPUT_RESOLUTION)))
@@ -82,6 +90,7 @@ is_slam_system_initialized      = False
 processed_frames_history : list = []
 keyframe_indices          : list = []
 world_point_cloud_buffer  : list = []
+camera_positions : list = []       # running trail of camera centres
 
 current_frame_index                = 0
 slam_initialization_buffer   : list = []
@@ -115,6 +124,19 @@ def matrix_to_quaternion(m: np.ndarray) -> np.ndarray:
         q[k] = (m[k, i] + m[i, k]) * t
     return q
 
+# ------------------------------------------------------------------
+# Coordinate‑system helpers
+# ------------------------------------------------------------------
+def cv_to_rerun_xyz(xyz: np.ndarray) -> np.ndarray:
+    """
+    Convert point coordinates from the OpenCV camera convention
+    (x → right, y → down, z → forward) to the Rerun
+    RIGHT_HAND_Y_UP convention (x → right, y → up, z → forward).
+    """
+    xyz_rerun = xyz.copy()
+    xyz_rerun[:, 1] *= -1.0           # flip vertical axis
+    return xyz_rerun
+
 def estimate_rigid_transform_svd(P: np.ndarray, Q: np.ndarray):
     """SVD‑based Umeyama alignment."""
     if len(P) < 3:
@@ -143,13 +165,24 @@ def preprocess_image(img_bgr: np.ndarray, target_w: int, target_h: int, intrinsi
         intrinsics = {k: v * (sx if k in ("fx", "cx") else sy) for k, v in intrinsics.items()}
     return tensor.to(device), intrinsics
 
-def log_points_to_rerun(label: str, xyz: np.ndarray, *, color=(0, 0, 255), radius=0.007):
+def log_points_to_rerun(label: str, xyz: np.ndarray, *, rgb: np.ndarray | None = None, radius: float = 0.007, fallback_color=(0, 0, 255)):
     if not rerun_connected or xyz is None or xyz.size == 0:
         return
-    colors = np.tile(color, (xyz.shape[0], 1))
-    rr.log(label, rr.Points3D(positions=xyz.astype(np.float32),
-                              colors=colors.astype(np.uint8),
-                              radii=np.full(xyz.shape[0], radius, np.float32)))
+    xyz = cv_to_rerun_xyz(xyz)
+    if rgb is None:
+        colors = np.tile(fallback_color, (xyz.shape[0], 1)).astype(np.uint8)
+    else:
+        if len(rgb) != len(xyz):
+            raise ValueError("rgb array length must match xyz length")
+        colors = rgb.astype(np.uint8)
+    rr.log(
+        label,
+        rr.Points3D(
+            positions=xyz.astype(np.float32),
+            colors=colors,
+            radii=np.full(xyz.shape[0], radius, np.float32),
+        ),
+    )
 
 # ------------------------------------------------------------------------------
 # Device helper for tensors
@@ -170,23 +203,39 @@ async def initialise_models_and_params():
     # Rerun handshake (run once)
     if os.getenv("RERUN_ENABLED", "true") == "true" and not rerun_connected:
         rr.init("SLAM3R_Processor", spawn=False)
-        for host in (
+        # ------------------------------------------------------------------
+        # Robust Rerun connection: try a short list of candidates, but
+        # *verify the pipe drains* (flush test) before assuming success.
+        # ------------------------------------------------------------------
+        host_candidates = [
             os.getenv("RERUN_CONNECT_URL"),
-            "rerun+http://127.0.0.1:9876/proxy",
             "rerun+http://host.docker.internal:9876/proxy",
-        ):
+            "rerun+http://127.0.0.1:9876/proxy",
+        ]
+        for host in host_candidates:
             if not host:
                 continue
             try:
-                rr.connect_grpc(host, flush_timeout_sec=4)
+                rr.connect_grpc(host, flush_timeout_sec=15)
+                # quick sanity ping – if this hangs we treat it as a failure
+                rr.log(
+                    "healthcheck",
+                    rr.TextLog(text="SLAM3R handshake ✔"),
+                )
                 rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_UP, static=True)
                 rerun_connected = True
                 logger.info("Connected to Rerun at %s", host)
                 break
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Failed to connect/flush to Rerun at %s: %s", host, e)
+                try:
+                    rr.disconnect()
+                except Exception:
+                    pass
         if not rerun_connected:
-            logger.warning("No Rerun viewer reachable – continuing without live viz.")
+            logger.warning(
+                "All Rerun connection attempts failed – continuing without live viz."
+            )
 
     logger.info("Loading SLAM3R models (device=%s)…", device)
     i2p_model = Image2PointsModel.from_pretrained("siyan824/slam3r_i2p").to(device).eval()
@@ -268,6 +317,7 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
     }
 
     temp_world_pts = []
+    temp_world_cols = []
     keyframe_id_out = None
 
     # ─────────────────────────────────────────────────────────────────── bootstrap
@@ -362,6 +412,19 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
     pred = i2p_inference_batch(mv_input, i2p_model, ref_id=0)["preds"][0]
     record["pts3d_cam"], record["conf_cam"] = pred["pts3d"], pred["conf"]
 
+    # --------------------------------------------------------------
+    # Accumulate high‑confidence world points so the viewer shows
+    # the full reconstruction instead of only the most recent slice.
+    # --------------------------------------------------------------
+    if "pts3d_world" in record:
+        if record.get("conf_cam") is not None:
+            conf_np = record["conf_cam"].cpu().numpy()
+            pts_np  = record["pts3d_world"].cpu().numpy()
+            mask = conf_np > slam_params["conf_thres_l2w"]
+            world_point_cloud_buffer.extend(pts_np[mask])
+        else:
+            world_point_cloud_buffer.extend(record["pts3d_world"].cpu().numpy().reshape(-1, 3))
+
     # ------------------------------------------------------------------
     # Build device‑safe reference & source views
     # ------------------------------------------------------------------
@@ -379,6 +442,12 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
 
     # Bail out gracefully until we have at least one fully registered keyframe
     if not cand_views:
+        # --------------------------------------------------------------
+        # Live point‑cloud update to Rerun
+        # --------------------------------------------------------------
+        if world_point_cloud_buffer:
+            xyz_stack = np.vstack(world_point_cloud_buffer)
+            log_points_to_rerun("world/points", xyz_stack, radius=0.004)
         processed_frames_history.append(record)
         current_frame_index += 1
         return None, None, None
