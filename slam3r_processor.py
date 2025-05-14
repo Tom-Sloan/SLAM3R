@@ -1,7 +1,9 @@
 # slam3r/slam3r_processor.py
 # – Consumes RGB frames from RabbitMQ
 # – Runs the SLAM3R incremental pipeline (I2P → L2W → pose SVD → KF logic)
-# – Publishes pose / point-cloud / recon-viz messages (and optional Rerun stream)
+# – Publishes pose / point‑cloud / recon‑viz messages (and optional Rerun stream)
+#
+# Default env‑vars are inlined so the script works out‑of‑the‑box.
 
 import asyncio, gzip, json, logging, os, random, time
 from datetime import datetime
@@ -10,9 +12,9 @@ from pathlib import Path
 import aio_pika, cv2, numpy as np, torch, yaml
 import rerun as rr
 
-# ────────────────────────────────────────────────────────────────────────────────
-#  Imports from SLAM3R engine
-# ────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
+# Imports from SLAM3R engine
+# ───────────────────────────────────────────────────────────────────────────────
 SLAM3R_ENGINE_AVAILABLE = False
 try:
     from SLAM3R_engine.recon import (
@@ -29,18 +31,16 @@ except ImportError as e:
     logging.error("SLAM3R_engine not importable: %s", e)
     raise e
 
-# ────────────────────────────────────────────────────────────────────────────────
-#  Logging
-# ────────────────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s",
-)
+# ───────────────────────────────────────────────────────────────────────────────
+# Logging
+# ───────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s  %(levelname)s  %(message)s")
 logger = logging.getLogger("slam3r_processor")
 
-# ────────────────────────────────────────────────────────────────────────────────
-#  Environment / config
-# ────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
+# Environment / config (with sane defaults)
+# ───────────────────────────────────────────────────────────────────────────────
 RABBITMQ_URL                       = os.getenv("RABBITMQ_URL", "amqp://rabbitmq")
 VIDEO_FRAMES_EXCHANGE_IN           = os.getenv("VIDEO_FRAMES_EXCHANGE", "video_frames_exchange")
 RESTART_EXCHANGE_IN                = os.getenv("RESTART_EXCHANGE",    "restart_exchange")
@@ -55,55 +55,39 @@ CHECKPOINTS_DIR                    = os.getenv("SLAM3R_CHECKPOINTS_DIR", "/check
 SLAM3R_CONFIG_FILE_PATH_IN_CONTAINER= os.getenv("SLAM3R_CONFIG_FILE", "/app/SLAM3R_engine/configs/wild.yaml")
 CAMERA_INTRINSICS_FILE_PATH        = os.getenv("CAMERA_INTRINSICS_FILE", "/app/SLAM3R_engine/configs/camera_intrinsics.yaml")
 
-
-# Models were trained on 224 × 224 crops ─ keep that as the canonical default.
 DEFAULT_MODEL_INPUT_RESOLUTION = 224
-_req_batch = int(os.getenv("SLAM3R_INFERENCE_BATCH", "1"))
-if _req_batch > 1:
-    logger.warning(
-        "SLAM3R_INFERENCE_BATCH=%d is not yet supported by the L2W path – "
-        "forcing it to 1 to avoid shape mismatches.",
-        _req_batch,
-    )
 INFERENCE_WINDOW_BATCH = 1
 
-TARGET_IMAGE_WIDTH  = int(os.getenv("TARGET_IMAGE_WIDTH",
-                                    str(DEFAULT_MODEL_INPUT_RESOLUTION)))
-TARGET_IMAGE_HEIGHT = int(os.getenv("TARGET_IMAGE_HEIGHT",
-                                    str(DEFAULT_MODEL_INPUT_RESOLUTION)))
+TARGET_IMAGE_WIDTH  = int(os.getenv("TARGET_IMAGE_WIDTH",  DEFAULT_MODEL_INPUT_RESOLUTION))
+TARGET_IMAGE_HEIGHT = int(os.getenv("TARGET_IMAGE_HEIGHT", DEFAULT_MODEL_INPUT_RESOLUTION))
 
 INIT_QUALITY_MIN_CONF   = float(os.getenv("INITIALIZATION_QUALITY_MIN_AVG_CONFIDENCE", "1.0"))
 INIT_QUALITY_MIN_POINTS = int  (os.getenv("INITIALIZATION_QUALITY_MIN_TOTAL_VALID_POINTS", "100"))
 
-# ────────────────────────────────────────────────────────────────────────────────
-#  Global run-time state
-# ────────────────────────────────────────────────────────────────────────────────
-device                          = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-i2p_model                       = l2w_model = None
-slam_params                     = {}
-is_slam_system_initialized      = False
+# ───────────────────────────────────────────────────────────────────────────────
+# Global run‑time state
+# ───────────────────────────────────────────────────────────────────────────────
+device                   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+i2p_model                = l2w_model = None
+slam_params              = {}
+is_slam_system_initialized = False
 
 processed_frames_history : list = []
-keyframe_indices          : list = []
-world_point_cloud_buffer  : list = []   # (xyz,rgb) tuples
-camera_positions : list = []            # running trail of camera centres
+keyframe_indices         : list = []
+world_point_cloud_buffer : list = []   # (xyz, rgb)
+camera_positions         : list = []
 
-current_frame_index                = 0
-slam_initialization_buffer   : list = []
-is_slam_initialized_for_session    = False
-active_kf_stride                   = 1
+current_frame_index              = 0
+slam_initialization_buffer : list = []
+is_slam_initialized_for_session  = False
+active_kf_stride                 = 1
 
-rerun_connected = False  # viewer link flag
-
+rerun_connected = False  # live viewer flag
 
 # ───────────────────────────────────────────────────────────────────────────────
-#  Camera intrinsics (helper + one‑time load)
+# Camera intrinsics helper
 # ───────────────────────────────────────────────────────────────────────────────
 def load_yaml_intrinsics(path: str):
-    """
-    Return a dict with keys fx, fy, cx, cy read from a YAML file.
-    Returns None if the file is missing or malformed.
-    """
     p = Path(path)
     if not p.exists():
         return None
@@ -118,152 +102,124 @@ camera_intrinsics = load_yaml_intrinsics(CAMERA_INTRINSICS_FILE_PATH) or {}
 if not camera_intrinsics:
     logger.warning("No camera intrinsics found – skipping frustum logging.")
 
-#
-# ────────────────────────────────────────────────────────────────────────────────
-#  Utility helpers
-# ────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
+# Utility helpers
+# ───────────────────────────────────────────────────────────────────────────────
 def matrix_to_quaternion(m: np.ndarray) -> np.ndarray:
     q = np.empty(4); t = np.trace(m)
     if t > 0:
         t = np.sqrt(t + 1); q[3] = 0.5 * t; t = 0.5 / t
-        q[0] = (m[2, 1] - m[1, 2]) * t
-        q[1] = (m[0, 2] - m[2, 0]) * t
-        q[2] = (m[1, 0] - m[0, 1]) * t
+        q[0] = (m[2,1]-m[1,2])*t; q[1] = (m[0,2]-m[2,0])*t; q[2] = (m[1,0]-m[0,1])*t
     else:
-        i = np.argmax(np.diag(m)); j, k = (i + 1) % 3, (i + 2) % 3
-        t = np.sqrt(m[i, i] - m[j, j] - m[k, k] + 1)
-        q[i] = 0.5 * t; t = 0.5 / t
-        q[3] = (m[k, j] - m[j, k]) * t
-        q[j] = (m[j, i] + m[i, j]) * t
-        q[k] = (m[k, i] + m[i, k]) * t
+        i = np.argmax(np.diag(m)); j, k = (i+1)%3, (i+2)%3
+        t = np.sqrt(m[i,i]-m[j,j]-m[k,k]+1)
+        q[i] = 0.5*t; t = 0.5/t
+        q[3] = (m[k,j]-m[j,k])*t; q[j] = (m[j,i]+m[i,j])*t; q[k] = (m[k,i]+m[i,k])*t
     return q
 
 def cv_to_rerun_xyz(xyz: np.ndarray) -> np.ndarray:
-    """
-    Convert from OpenCV (x→right, y→down, z→forward)
-    to Rerun RIGHT_HAND_Y_UP (x→right, y→up, z→forward).
-    """
-    xyz_rerun = xyz.copy()
-    xyz_rerun[:, 1] *= -1.0     # flip vertical
-    xyz_rerun[:, 0] *= -1.0     # NEW – flip left/right
-    return xyz_rerun
+    xyz = xyz.copy()
+    xyz[:,1] *= -1.0   # flip vertical
+    xyz[:,0] *= -1.0   # flip left/right
+    return xyz
 
 def estimate_rigid_transform_svd(P: np.ndarray, Q: np.ndarray):
-    if len(P) < 3: return np.eye(3), np.zeros((3, 1))
-    Pc, Qc = P - P.mean(0), Q - Q.mean(0)
-    U, _, Vt = np.linalg.svd(Pc.T @ Qc)
+    if len(P) < 3:
+        return np.eye(3), np.zeros((3,1))
+    Pc, Qc = P-P.mean(0), Q-Q.mean(0)
+    U,_,Vt = np.linalg.svd(Pc.T @ Qc)
     R = Vt.T @ U.T
-    if np.linalg.det(R) < 0: Vt[2] *= -1; R = Vt.T @ U.T
-    t = Q.mean(0, keepdims=True).T - R @ P.mean(0, keepdims=True).T
+    if np.linalg.det(R) < 0:
+        Vt[2] *= -1; R = Vt.T @ U.T
+    t = Q.mean(0,keepdims=True).T - R @ P.mean(0,keepdims=True).T
     return R, t
 
-def preprocess_image(img_bgr: np.ndarray, w: int, h: int):
-    img_rgb = cv2.cvtColor(cv2.resize(img_bgr, (w, h)), cv2.COLOR_BGR2RGB)
-    tensor  = torch.tensor(img_rgb, dtype=torch.float32).permute(2, 0, 1) / 255.0
-    return tensor.to(device), None
+def preprocess_image(img_bgr: np.ndarray):
+    img_rgb = cv2.cvtColor(cv2.resize(img_bgr,(TARGET_IMAGE_WIDTH,TARGET_IMAGE_HEIGHT)),cv2.COLOR_BGR2RGB)
+    tensor  = torch.tensor(img_rgb,dtype=torch.float32).permute(2,0,1)/255.0
+    return tensor.to(device)
 
-# ────────────────────────────  new helpers  ────────────────────────────
 def colors_from_image(tensor_chw: torch.Tensor) -> np.ndarray:
-    img = (tensor_chw.permute(1, 2, 0).cpu().numpy() * 255.0)
-    return img.astype(np.uint8).reshape(-1, 3)
+    return (tensor_chw.permute(1,2,0).cpu().numpy()*255).astype(np.uint8).reshape(-1,3)
 
-def log_points_to_rerun(label: str,
-                        pts_col_pairs: list[tuple[np.ndarray, np.ndarray]],
-                        *,
-                        radius: float = 0.007):
-    if not rerun_connected or not pts_col_pairs:
+def log_points_to_rerun(label:str, pts_col:list, radius:float=0.007):
+    if not rerun_connected or not pts_col:
         return
-    xyz, rgb = map(np.asarray, zip(*pts_col_pairs))
-    rr.log(label,
-           rr.Points3D(
-               positions=cv_to_rerun_xyz(xyz.astype(np.float32)),
-               colors=rgb.astype(np.uint8),
-               radii=np.full(len(xyz), radius, np.float32),
-           ))
+    xyz, rgb = map(np.asarray, zip(*pts_col))
+    rr.log(label, rr.Points3D(positions=cv_to_rerun_xyz(xyz.astype(np.float32)),
+                              colors=rgb.astype(np.uint8),
+                              radii=np.full(len(xyz), radius, np.float32)))
 
-# ------------------------------------------------------------------------------
-def _to_dev(x):  # tensor device helper
+def _to_dev(x):
     return x.to(device) if torch.is_tensor(x) and x.device != device else x
 
-# ────────────────────────────────────────────────────────────────────────────────
-#  Initialisation
-# ────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
+# Initialisation
+# ───────────────────────────────────────────────────────────────────────────────
 async def initialise_models_and_params():
     global i2p_model, l2w_model, slam_params, is_slam_system_initialized, rerun_connected
     if is_slam_system_initialized or not SLAM3R_ENGINE_AVAILABLE:
         return
 
-    if os.getenv("RERUN_ENABLED", "true") == "true" and not rerun_connected:
+    # Rerun handshake
+    if os.getenv("RERUN_ENABLED", "true") == "true":
         rr.init("SLAM3R_Processor", spawn=False)
-        for host in filter(None, [
-            os.getenv("RERUN_CONNECT_URL"),
-            "rerun+http://host.docker.internal:9876/proxy",
-            "rerun+http://127.0.0.1:9876/proxy",
-        ]):
+        for host in filter(None,[os.getenv("RERUN_CONNECT_URL"),
+                                 "rerun+http://host.docker.internal:9876/proxy",
+                                 "rerun+http://127.0.0.1:9876/proxy"]):
             try:
                 rr.connect_grpc(host, flush_timeout_sec=15)
-                rr.log("healthcheck", rr.TextLog(text="SLAM3R handshake ✔"))
                 rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_UP, static=True)
-                rerun_connected = True; logger.info("Connected to Rerun at %s", host); break
+                rerun_connected = True
+                logger.info("Connected to Rerun at %s", host)
+                break
             except Exception as e:
-                logger.warning("Failed to connect Rerun at %s: %s", host, e)
-        if not rerun_connected:
-            logger.warning("All Rerun connection attempts failed – running headless.")
+                logger.warning("Rerun connect failed at %s: %s", host, e)
 
-    logger.info("Loading SLAM3R models (device=%s)…", device)
+    logger.info("Loading SLAM3R models on %s…", device)
     i2p_model = Image2PointsModel.from_pretrained("siyan824/slam3r_i2p").to(device).eval()
     l2w_model = Local2WorldModel.from_pretrained("siyan824/slam3r_l2w").to(device).eval()
 
-    cfg = yaml.safe_load(Path(SLAM3R_CONFIG_FILE_PATH_IN_CONTAINER).read_text()) \
-          if Path(SLAM3R_CONFIG_FILE_PATH_IN_CONTAINER).exists() else {}
+    cfg = yaml.safe_load(Path(SLAM3R_CONFIG_FILE_PATH_IN_CONTAINER).read_text()) if Path(SLAM3R_CONFIG_FILE_PATH_IN_CONTAINER).exists() else {}
     rp, ka = cfg.get("recon_pipeline", {}), cfg.get("keyframe_adaptation", {})
     slam_params.update({
-        "keyframe_stride":            rp.get("keyframe_stride",        -1),
-        "initial_winsize":            rp.get("initial_winsize",        5),
-        "win_r":                      rp.get("win_r",                  3),
-        "conf_thres_i2p":             float(os.getenv("SLAM3R_CONF_THRES_I2P",  rp.get("conf_thres_i2p", 1.5))),
-        "conf_thres_l2w":             float(os.getenv("SLAM3R_CONF_THRES_L2W",  rp.get("conf_thres_l2w", 12.0))),
-        "num_scene_frame":            rp.get("num_scene_frame",        10),
-        "norm_input_l2w":             rp.get("norm_input_l2w",         False),
-        "buffer_size":                rp.get("buffer_size",            100),
-        "buffer_strategy":            rp.get("buffer_strategy",        "reservoir"),
-        "keyframe_adapt_min":         ka.get("adapt_min",              1),
-        "keyframe_adapt_max":         ka.get("adapt_max",              5),
-        "keyframe_adapt_stride_step": ka.get("adapt_stride_step",      1),
+        "keyframe_stride":      rp.get("keyframe_stride",       -1),
+        "initial_winsize":      rp.get("initial_winsize",        5),
+        "win_r":                rp.get("win_r",                 3),
+        "conf_thres_i2p": float(os.getenv("SLAM3R_CONF_THRES_I2P", rp.get("conf_thres_i2p", 1.5))),
+        "conf_thres_l2w": float(os.getenv("SLAM3R_CONF_THRES_L2W", rp.get("conf_thres_l2w", 12.0))),
+        "num_scene_frame":      rp.get("num_scene_frame",       10),
+        "norm_input_l2w":       rp.get("norm_input_l2w",    False),
+        "buffer_size":          rp.get("buffer_size",          100),
+        "buffer_strategy":      rp.get("buffer_strategy", "reservoir"),
+        "keyframe_adapt_min":   ka.get("adapt_min",             1),
+        "keyframe_adapt_max":   ka.get("adapt_max",             20),
+        "keyframe_adapt_stride_step": ka.get("adapt_stride_step",1),
     })
-    logger.info("SLAM params: %s", slam_params)
     is_slam_system_initialized = True
 
-# ────────────────────────────────────────────────────────────────────────────────
-#  Per-frame processing
-# ────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
+# Per‑frame processing
+# ───────────────────────────────────────────────────────────────────────────────
 async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
-    global current_frame_index, is_slam_initialized_for_session
-    global slam_initialization_buffer, active_kf_stride
+    global current_frame_index, is_slam_initialized_for_session, slam_initialization_buffer, active_kf_stride
 
     start = time.time()
-    tensor, _ = preprocess_image(img_bgr, TARGET_IMAGE_WIDTH, TARGET_IMAGE_HEIGHT)
-
-    img_rgb_u8 = (tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    tensor = preprocess_image(img_bgr)
+    img_rgb_u8 = (tensor.permute(1,2,0).cpu().numpy()*255).astype(np.uint8)
     if rerun_connected:
         rr.log("camera_lowres/rgb", rr.Image(img_rgb_u8))
 
-    view = {
-        "img": tensor.unsqueeze(0),
-        "true_shape": torch.tensor([[TARGET_IMAGE_HEIGHT, TARGET_IMAGE_WIDTH]], device=device),
-        "label": f"frame_{current_frame_index}",
-    }
-    record = {
-        "img_tensor": tensor,
-        "true_shape": view["true_shape"].squeeze(0),
-        "timestamp_ns": ts_ns,
-        "raw_pose_matrix": np.eye(4).tolist(),
-    }
+    view = {"img": tensor.unsqueeze(0),
+            "true_shape": torch.tensor([[TARGET_IMAGE_HEIGHT, TARGET_IMAGE_WIDTH]], device=device)}
+    record = {"img_tensor": tensor,
+              "true_shape": view["true_shape"].squeeze(0),
+              "timestamp_ns": ts_ns,
+              "raw_pose_matrix": np.eye(4).tolist()}
 
-    temp_world_pts: list[tuple[np.ndarray, np.ndarray]] = []
-    keyframe_id_out = None
+    temp_world_pts: list = []; keyframe_id_out = None
 
-    # ──────────────────────────── bootstrap ────────────────────────────
+    # ───────── bootstrap ─────────
     if not is_slam_initialized_for_session:
         slam_initialization_buffer.append(view)
         if len(slam_initialization_buffer) < slam_params["initial_winsize"]:
@@ -423,9 +379,9 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
             rr.log(
                 frustum_path + "/pinhole",
                 rr.Pinhole(
-                    focal_length_px=[camera_intrinsics['fx'], camera_intrinsics['fy']],
-                    principal_point_px=[camera_intrinsics['cx'], camera_intrinsics['cy']],
-                    image_size_px=[TARGET_IMAGE_WIDTH, TARGET_IMAGE_HEIGHT],
+                    focal_length=[camera_intrinsics['fx'], camera_intrinsics['fy']],
+                    principal_point=[camera_intrinsics['cx'], camera_intrinsics['cy']],
+                    resolution=[TARGET_IMAGE_WIDTH, TARGET_IMAGE_HEIGHT],
                 ),
             )
             rr.log(frustum_path + "/image", rr.Image(img_rgb_u8))    

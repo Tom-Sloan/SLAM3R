@@ -1,7 +1,7 @@
 # SLAM3R configuration for wild scene reconstruction
 recon_pipeline:
   keyframe_stride: -1  # -1 for auto-adaptive keyframe stride selection
-  win_r: 3  # radius for I2P local window
+  win_r: 5  # radius for I2P local window
   num_scene_frame: 10  # number of frames for scene reference
   initial_winsize: 5  # number of frames for initialization
   conf_thres_l2w: 12  # confidence threshold for L2W
@@ -11,7 +11,7 @@ recon_pipeline:
   update_buffer_intv_factor: 1  # update buffer interval factor
   buffer_size: 100  # -1 if size is not limited
   buffer_strategy: "reservoir"  # or "fifo"
-  norm_input_l2w: false  # whether to normalaize the input pointmaps for L2W
+  norm_input_l2w: true  # whether to normalaize the input pointmaps for L2W
 
 keyframe_adaptation:
   adapt_min: 1  # minimum stride for keyframe adaptation
