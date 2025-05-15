@@ -41,19 +41,22 @@ logger = logging.getLogger("slam3r_processor")
 # ───────────────────────────────────────────────────────────────────────────────
 # Environment / config (with sane defaults)
 # ───────────────────────────────────────────────────────────────────────────────
-RABBITMQ_URL                       = os.getenv("RABBITMQ_URL", "amqp://rabbitmq")
-VIDEO_FRAMES_EXCHANGE_IN           = os.getenv("VIDEO_FRAMES_EXCHANGE", "video_frames_exchange")
-RESTART_EXCHANGE_IN                = os.getenv("RESTART_EXCHANGE",    "restart_exchange")
+RABBITMQ_URL                                = os.getenv("RABBITMQ_URL", "amqp://rabbitmq")
+VIDEO_FRAMES_EXCHANGE_IN                    = os.getenv("VIDEO_FRAMES_EXCHANGE", "video_frames_exchange")
+RESTART_EXCHANGE_IN                         = os.getenv("RESTART_EXCHANGE", "restart_exchange")
 
-SLAM3R_POSE_EXCHANGE_OUT           = os.getenv("SLAM3R_POSE_EXCHANGE",              "slam3r_pose_exchange")
-SLAM3R_POINTCLOUD_EXCHANGE_OUT     = os.getenv("SLAM3R_POINTCLOUD_EXCHANGE",        "slam3r_pointcloud_exchange")
-SLAM3R_RECONSTRUCTION_VIS_EXCHANGE_OUT = os.getenv("SLAM3R_RECONSTRUCTION_VIS_EXCHANGE",
-                                                   "slam3r_reconstruction_vis_exchange")
-OUTPUT_TO_RABBITMQ                 = os.getenv("SLAM3R_OUTPUT_TO_RABBITMQ", "false").lower() == "true"
+SLAM3R_POSE_EXCHANGE_OUT                    = os.getenv("SLAM3R_POSE_EXCHANGE", "slam3r_pose_exchange")
+SLAM3R_POINTCLOUD_EXCHANGE_OUT              = os.getenv("SLAM3R_POINTCLOUD_EXCHANGE", "slam3r_pointcloud_exchange")
+SLAM3R_RECONSTRUCTION_VIS_EXCHANGE_OUT      = os.getenv("SLAM3R_RECONSTRUCTION_VIS_EXCHANGE","slam3r_reconstruction_vis_exchange")
+OUTPUT_TO_RABBITMQ                          = os.getenv("SLAM3R_OUTPUT_TO_RABBITMQ", "false").lower() == "true"
 
-CHECKPOINTS_DIR                    = os.getenv("SLAM3R_CHECKPOINTS_DIR", "/checkpoints_mount")
-SLAM3R_CONFIG_FILE_PATH_IN_CONTAINER= os.getenv("SLAM3R_CONFIG_FILE", "/app/SLAM3R_engine/configs/wild.yaml")
-CAMERA_INTRINSICS_FILE_PATH        = os.getenv("CAMERA_INTRINSICS_FILE", "/app/SLAM3R_engine/configs/camera_intrinsics.yaml")
+CHECKPOINTS_DIR                             = os.getenv("SLAM3R_CHECKPOINTS_DIR", "/checkpoints_mount")
+SLAM3R_CONFIG_FILE_PATH_IN_CONTAINER        = os.getenv("SLAM3R_CONFIG_FILE", "/app/SLAM3R_engine/configs/wild.yaml")
+CAMERA_INTRINSICS_FILE_PATH                 = os.getenv("CAMERA_INTRINSICS_FILE", "/app/SLAM3R_engine/configs/camera_intrinsics.yaml")
+FRUSTUMS_ENABLED                            = os.getenv("SLAM3R_FRUSTUMS_ENABLED", "false").lower() == "true"
+L2W_BATCH_SIZE                              = int(os.getenv("SLAM3R_L2W_BATCH_SIZE", "4"))     # mini-batch size ≤4
+MIN_INLIERS_SVD                             = int(os.getenv("SLAM3R_MIN_INLIERS_SVD", "20"))  # pose guard
+REFINE_ASYNC_ENABLED                        = os.getenv("SLAM3R_ENABLE_REFINEMENT", "true").lower() == "true"
 
 DEFAULT_MODEL_INPUT_RESOLUTION = 224
 INFERENCE_WINDOW_BATCH = 1
@@ -76,6 +79,8 @@ processed_frames_history : list = []
 keyframe_indices         : list = []
 world_point_cloud_buffer : list = []   # (xyz, rgb)
 camera_positions         : list = []
+register_queue : list = []          # pending (record, src_view, ref_views)
+last_valid_T   = np.eye(4)          # fallback pose
 
 current_frame_index              = 0
 slam_initialization_buffer : list = []
@@ -98,9 +103,12 @@ def load_yaml_intrinsics(path: str):
         logger.warning("Failed to parse camera intrinsics YAML: %s", e)
         return None
 
-camera_intrinsics = load_yaml_intrinsics(CAMERA_INTRINSICS_FILE_PATH) or {}
-if not camera_intrinsics:
-    logger.warning("No camera intrinsics found – skipping frustum logging.")
+if FRUSTUMS_ENABLED:
+    camera_intrinsics = load_yaml_intrinsics(CAMERA_INTRINSICS_FILE_PATH) or {}
+    if not camera_intrinsics:
+        logger.warning("No camera intrinsics found – skipping frustum logging.")
+else:
+    camera_intrinsics = {}
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Utility helpers
@@ -312,23 +320,53 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
     ref_views, _ = slam3r_scene_frame_retrieve(
         cand_views, [src_view], i2p_model,
         sel_num=min(slam_params["num_scene_frame"], len(cand_views)))
-    l2w_out = l2w_inference(ref_views + [src_view], l2w_model,
-                            ref_ids=list(range(len(ref_views))),
-                            device=device, normalize=slam_params["norm_input_l2w"])[-1]
-    record["pts3d_world"], record["conf_world"] = l2w_out["pts3d_in_other_view"], l2w_out["conf"]
 
-    # -------- pose SVD --------
-    P_cam   = record["pts3d_cam"].squeeze(0).cpu().reshape(-1, 3).numpy()
-    P_world = record["pts3d_world"].squeeze(0).cpu().reshape(-1, 3).numpy()
+    register_queue.append((record, src_view, ref_views))
+    if len(register_queue) < L2W_BATCH_SIZE and current_frame_index != 0:
+        processed_frames_history.append(record); current_frame_index += 1
+        return None, None, None
+
+    # ---- batched L2W -----------------------------------------------------
+    batch_ref, batch_src = [], []
+    for _rec, _src, _refs in register_queue:
+        batch_ref.extend(_refs)
+        batch_src.append(_src)
+
+    outs = l2w_inference(batch_ref + batch_src, l2w_model,
+                         ref_ids=list(range(len(batch_ref))),
+                         device=device,
+                         normalize=slam_params["norm_input_l2w"])
+
+    ptr = len(batch_ref)
+    for (_rec, _src, _), out in zip(register_queue, outs[ptr:]):
+        _rec["pts3d_world"], _rec["conf_world"] = out["pts3d_in_other_view"], out["conf"]
+    
+    for _rec in (tpl[0] for tpl in register_queue):
+        P_w   = _rec["pts3d_world"].squeeze(0).cpu().reshape(-1,3).numpy()
+        conf  = _rec["conf_world"].squeeze().cpu().numpy().reshape(-1)
+        clr   = colors_from_image(_rec["img_tensor"])
+
+        keep  = conf > slam_params["conf_thres_l2w"]
+        world_point_cloud_buffer.extend(
+            [ (P_w[i].tolist(), clr[i].tolist()) for i in np.nonzero(keep)[0] ]
+        )
+    register_queue.clear()
+
+    record["pts3d_world"], record["conf_world"] = _rec["pts3d_world"], _rec["conf_world"]
+
+    # -------- pose SVD (with hard guard) ----------------------------
+    P_cam   = record["pts3d_cam"].squeeze(0).cpu().reshape(-1,3).numpy()
+    P_world = record["pts3d_world"].squeeze(0).cpu().reshape(-1,3).numpy()
     conf_cam_flat   = record["conf_cam"].squeeze().cpu().numpy().reshape(-1)
     conf_world_flat = record["conf_world"].squeeze().cpu().numpy().reshape(-1)
     mask = ((conf_cam_flat > slam_params["conf_thres_i2p"]) &
             (conf_world_flat > slam_params["conf_thres_l2w"]))
-    if mask.sum() < 3:
-        mask = ((conf_cam_flat > slam_params["conf_thres_i2p"]) &
-                (conf_world_flat > 0.5 * slam_params["conf_thres_l2w"]))
-    R, t = estimate_rigid_transform_svd(P_cam[mask], P_world[mask]) if mask.sum() >=3 else (np.eye(3), np.zeros((3,1)))
-    T = np.eye(4); T[:3,:3], T[:3,3] = R, t.squeeze()
+    if mask.sum() >= MIN_INLIERS_SVD:
+        R, t = estimate_rigid_transform_svd(P_cam[mask], P_world[mask])
+        T = np.eye(4); T[:3,:3], T[:3,3] = R, t.squeeze()
+        last_valid_T[:] = T
+    else:                                   # reuse previous transform
+        T = last_valid_T.copy()
     record["raw_pose_matrix"] = T.tolist()
 
     # -------------- accumulate points --------------
@@ -367,7 +405,7 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
         if keyframe_id_out:
             rr.log("log/info", rr.TextLog(text=f"KF {keyframe_id_out} added", color=[0,255,0]))
 
-        if camera_intrinsics:
+        if FRUSTUMS_ENABLED and camera_intrinsics:
             frustum_path = f"world/camera_frustums/frame_{current_frame_index}"
             rr.log(
                 frustum_path,
@@ -385,6 +423,24 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
                 ),
             )
             rr.log(frustum_path + "/image", rr.Image(img_rgb_u8))    
+
+    # ---------- key-frame stride re-adapt ----------------
+    if current_frame_index in (5,100) or current_frame_index % 300 == 0:
+        slice_ = processed_frames_history[-300:] if len(processed_frames_history)>300 else processed_frames_history
+        active_kf_stride = slam3r_adapt_keyframe_stride(
+            slice_, i2p_model,
+            win_r=slam_params["win_r"],
+            adapt_min=slam_params["keyframe_adapt_min"],
+            adapt_max=slam_params["keyframe_adapt_max"],
+            adapt_stride=slam_params["keyframe_adapt_stride_step"])
+        logger.info("Adapted key-frame stride → %d", active_kf_stride)
+
+    # ---------- async refinement -------------------------
+    if REFINE_ASYNC_ENABLED and len(keyframe_indices) > 30:
+        kf_idx = keyframe_indices[-30]
+        if not processed_frames_history[kf_idx].get("refine_scheduled"):
+            processed_frames_history[kf_idx]["refine_scheduled"] = True
+            asyncio.create_task(refine_keyframe(kf_idx))
 
     # ---------- RabbitMQ payloads ----------
     sampled_pairs = random.sample(temp_world_pts, 50_000) if len(temp_world_pts) > 50_000 else temp_world_pts
@@ -405,6 +461,54 @@ async def process_image_with_slam3r(img_bgr: np.ndarray, ts_ns: int):
     current_frame_index += 1
     logger.info("Frame %d processed in %.2fs", current_frame_index-1, time.time()-start)
     return pose_msg, pc_msg, vis_msg
+
+# ────────────────────────────────────────────────────────────────────────────────
+#  Background key-frame refinement task
+# ────────────────────────────────────────────────────────────────────────────────
+async def refine_keyframe(kf_idx: int):
+    """
+    Re-run L2W for an older key-frame against the latest buffering set.
+    Runs in a background asyncio task so it never blocks the live path.
+    """
+    try:
+        # Assemble current reference views (key-frames that already have world points)
+        ref_views = []
+        for idx in keyframe_indices:
+            kv = processed_frames_history[idx]
+            if "pts3d_world" not in kv:
+                continue
+            ref_views.append({
+                "img_tokens":  _to_dev(kv["img_tokens"]),
+                "img_pos":     _to_dev(kv["img_pos"]),
+                "true_shape":  _to_dev(kv["true_shape"]),
+                "pts3d_world": _to_dev(kv["pts3d_world"]),
+            })
+
+        src_rec = processed_frames_history[kf_idx]
+        if "pts3d_cam" not in src_rec:
+            # nothing to refine
+            return
+
+        src_view = {
+            "img_tokens": _to_dev(src_rec["img_tokens"]),
+            "img_pos":    _to_dev(src_rec["img_pos"]),
+            "true_shape": _to_dev(src_rec["true_shape"]),
+            "pts3d_cam":  _to_dev(src_rec["pts3d_cam"]),
+        }
+
+        out = l2w_inference(ref_views + [src_view], l2w_model,
+                            ref_ids=list(range(len(ref_views))),
+                            device=device,
+                            normalize=slam_params["norm_input_l2w"])[-1]
+
+        src_rec["pts3d_world"], src_rec["conf_world"] = (
+            out["pts3d_in_other_view"],
+            out["conf"],
+        )
+        logger.debug("Refined key-frame %d", kf_idx)
+
+    except Exception as e:
+        logger.warning("refine_keyframe(%d) failed: %s", kf_idx, e)
 
 # ────────────────────────────────────────────────────────────────────────────────
 #  RabbitMQ callbacks
@@ -489,3 +593,18 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Shutdown requested by user")
+
+#  ────  coroutine at end of file  ─────────────────────
+async def refine_keyframe(kf_idx:int):
+    try:
+        ref_views = [processed_frames_history[i] for i in keyframe_indices if "pts3d_world" in processed_frames_history[i]]
+        src_view  = processed_frames_history[kf_idx]
+        if "pts3d_cam" not in src_view:
+            return
+        out = l2w_inference(ref_views+[src_view], l2w_model,
+                            ref_ids=list(range(len(ref_views))),
+                            device=device,
+                            normalize=slam_params["norm_input_l2w"])[-1]
+        src_view["pts3d_world"], src_view["conf_world"] = out["pts3d_in_other_view"], out["conf"]
+    except Exception as e:
+        logger.warning("refine_keyframe %d failed: %s", kf_idx, e)
